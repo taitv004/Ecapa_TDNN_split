@@ -161,16 +161,36 @@ def normalize_and_segment(
     sources = discover_sources(raw_root)
     rows: list[dict[str, Any]] = []
     written = reused = dropped = 0
+    invalid_sources: list[dict[str, str]] = []
     for number, (speaker_id, source) in enumerate(sources, start=1):
-        audio, original_rate = sf.read(source, dtype="float32", always_2d=True)
-        if audio.shape[0] == 0 or audio.shape[1] == 0:
-            raise ValueError(f"Empty audio: {source}")
-        waveform = torch.from_numpy(audio.T.copy()).mean(dim=0, keepdim=True)
-        if not bool(torch.isfinite(waveform).all()):
-            raise ValueError(f"NaN or Inf audio: {source}")
-        if int(original_rate) != SAMPLE_RATE:
-            waveform = AF.resample(waveform, int(original_rate), SAMPLE_RATE)
-        waveform = waveform.squeeze(0).clamp(-1.0, 1.0)
+        try:
+            audio, original_rate = sf.read(source, dtype="float32", always_2d=True)
+            if audio.shape[0] == 0 or audio.shape[1] == 0:
+                raise ValueError("empty audio")
+            waveform = torch.from_numpy(audio.T.copy()).mean(dim=0, keepdim=True)
+            if not bool(torch.isfinite(waveform).all()):
+                raise ValueError("audio contains NaN or Inf")
+            if int(original_rate) <= 0:
+                raise ValueError(f"invalid sample rate: {original_rate}")
+            if int(original_rate) != SAMPLE_RATE:
+                waveform = AF.resample(waveform, int(original_rate), SAMPLE_RATE)
+            waveform = waveform.squeeze(0).clamp(-1.0, 1.0)
+        except Exception as error:
+            relative_source = source.relative_to(raw_root).as_posix()
+            invalid_sources.append(
+                {
+                    "speaker_id": speaker_id,
+                    "source": relative_source,
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                }
+            )
+            print(
+                f"SKIP INVALID AUDIO {relative_source} | "
+                f"{type(error).__name__}: {error}",
+                flush=True,
+            )
+            continue
 
         segment_index = 0
         start = 0
@@ -232,13 +252,21 @@ def normalize_and_segment(
         writer = csv.DictWriter(stream, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
+    invalid_report_path = processed_root / "invalid_audio_report.csv"
+    with invalid_report_path.open("w", encoding="utf-8", newline="") as stream:
+        fields = ("speaker_id", "source", "error_type", "error")
+        writer = csv.DictWriter(stream, fieldnames=fields, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(invalid_sources)
     return {
         "source_recordings": len(sources),
         "processed_segments": len(rows),
         "written_segments": written,
         "reused_segments": reused,
         "dropped_short_recordings": dropped,
+        "invalid_source_recordings": len(invalid_sources),
         "report": str(report_path),
+        "invalid_audio_report": str(invalid_report_path),
     }
 
 
@@ -528,6 +556,27 @@ def validate_shard(
         raise ValueError("Custom FBank shard does not match its manifest slice")
 
 
+def reclaim_processed_wavs(
+    processed_root: Path,
+    rows: Sequence[Mapping[str, Any]],
+) -> tuple[int, int]:
+    """Delete only processed WAVs whose completed cache shard was verified."""
+    root = processed_root.resolve(strict=True)
+    removed = 0
+    reclaimed = 0
+    for row in rows:
+        path = (root / str(row["relative_audio_path"])).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as error:
+            raise ValueError(f"Manifest path escapes processed root: {path}") from error
+        if path.is_file():
+            reclaimed += path.stat().st_size
+            path.unlink()
+            removed += 1
+    return removed, reclaimed
+
+
 def build_cache(
     repo_root: Path,
     processed_root: Path,
@@ -536,6 +585,7 @@ def build_cache(
     device: str,
     batch_size: int,
     shard_size: int,
+    delete_processed_after_shard: bool,
 ) -> dict[str, Any]:
     if batch_size < 1 or shard_size < 1:
         raise ValueError("batch_size and shard_size must be positive")
@@ -565,6 +615,13 @@ def build_cache(
             if shard_path.is_file():
                 existing = torch.load(shard_path, map_location="cpu", weights_only=False)
                 validate_shard(existing, shard_rows)
+                if delete_processed_after_shard:
+                    removed, reclaimed = reclaim_processed_wavs(processed_root, shard_rows)
+                    print(
+                        f"CACHE {split}: verified existing shard {shard_index + 1}/{count} | "
+                        f"deleted_wavs={removed} | reclaimed_MiB={reclaimed / 2**20:.2f}",
+                        flush=True,
+                    )
                 continue
             features: list[torch.Tensor] = []
             for batch_start in range(0, len(shard_rows), batch_size):
@@ -591,8 +648,16 @@ def build_cache(
             }
             validate_shard(shard, shard_rows)
             atomic_torch_save(shard_path, shard)
+            removed = reclaimed = 0
+            if delete_processed_after_shard:
+                # Deletion happens only after the persisted shard is loaded back
+                # and checked against the exact manifest slice.
+                persisted = torch.load(shard_path, map_location="cpu", weights_only=False)
+                validate_shard(persisted, shard_rows)
+                removed, reclaimed = reclaim_processed_wavs(processed_root, shard_rows)
             print(
-                f"CACHE {split}: shard {shard_index + 1}/{count} | rows={len(shard_rows)}",
+                f"CACHE {split}: shard {shard_index + 1}/{count} | rows={len(shard_rows)} | "
+                f"deleted_wavs={removed} | reclaimed_MiB={reclaimed / 2**20:.2f}",
                 flush=True,
             )
 
@@ -1110,6 +1175,7 @@ def parse_args() -> argparse.Namespace:
     cache.add_argument("--device", default="cuda:0")
     cache.add_argument("--batch-size", type=int, default=64)
     cache.add_argument("--shard-size", type=int, default=512)
+    cache.add_argument("--delete-processed-after-shard", action="store_true")
 
     train = subparsers.add_parser("train")
     add_shared_paths(train)
@@ -1160,6 +1226,7 @@ def main() -> int:
             args.device,
             args.batch_size,
             args.shard_size,
+            args.delete_processed_after_shard,
         )
         print(json.dumps(identity, indent=2, ensure_ascii=False))
     elif args.command == "train":
