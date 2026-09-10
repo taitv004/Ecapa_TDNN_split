@@ -31,6 +31,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+# Let unsupported MPS operations fall back to CPU instead of terminating the
+# whole evaluation. This must be set before importing torch.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
 import soundfile as sf
 import torch
 import torch.nn.functional as F
@@ -50,7 +54,7 @@ OUTPUT_DIR = Path(r"D:\ECAPA\test_results")
 # train/validation speaker-overlap check.
 KNOWN_SPEAKERS_CSV = ""
 
-DEVICE = "auto"               # "auto", "cuda:0", or "cpu"
+DEVICE = "auto"               # auto: CUDA -> Apple MPS -> CPU
 INFERENCE_BATCH_SIZE = 16      # reduce to 8 or 4 if GPU memory is insufficient
 TRIALS_PER_CLASS = 10_000      # maximum genuine and impostor trials
 TRIAL_SEED = 2026
@@ -184,12 +188,24 @@ def write_csv(path: Path, fields: Sequence[str], rows: Iterable[dict[str, Any]])
 
 def resolve_device(value: str) -> torch.device:
     if value == "auto":
-        value = "cuda:0" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            value = "cuda:0"
+        elif torch.backends.mps.is_available():
+            value = "mps"
+        else:
+            value = "cpu"
     device = torch.device(value)
-    if device.type not in {"cpu", "cuda"}:
-        raise ValueError("DEVICE must be 'auto', 'cpu', or a CUDA device such as 'cuda:0'")
+    if device.type not in {"cpu", "cuda", "mps"}:
+        raise ValueError(
+            "DEVICE must be 'auto', 'cpu', 'mps', or a CUDA device such as 'cuda:0'"
+        )
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but torch.cuda.is_available() is False")
+    if device.type == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError(
+            "MPS was requested but torch.backends.mps.is_available() is False. "
+            "Use an Apple Silicon Mac with an MPS-enabled PyTorch build, or select CPU."
+        )
     return device
 
 
@@ -283,9 +299,13 @@ def load_model(repo_root: Path, checkpoint_path: Path, device: torch.device):
     # The wrapper creates exactly the architecture used during training. On the
     # first run SpeechBrain may download its base configuration/checkpoint files;
     # the fine-tuned weights below then replace encoder and normalization states.
+    # The repository wrapper intentionally accepts only CPU/CUDA. For Apple
+    # MPS, instantiate it on CPU, retain FBank on CPU, and move only the
+    # normalization and fine-tuned ECAPA encoder to MPS.
+    frontend_device = "cpu" if device.type == "mps" else str(device)
     frontend = SpeechBrainECAPAFrontend(
         cache_dir=repo_root / "pretrained_models" / "spkrec-ecapa-voxceleb",
-        device=str(device),
+        device=frontend_device,
     )
     frontend.classifier.mods.embedding_model.load_state_dict(
         checkpoint["embedding_model_state_dict"], strict=True
@@ -293,6 +313,9 @@ def load_model(repo_root: Path, checkpoint_path: Path, device: torch.device):
     frontend.classifier.mods.mean_var_norm.load_state_dict(
         checkpoint["mean_var_norm_state_dict"], strict=True
     )
+    if device.type == "mps":
+        frontend.classifier.mods.mean_var_norm.to(device)
+        frontend.classifier.mods.embedding_model.to(device)
     frontend.eval()
     return frontend, checkpoint
 
@@ -314,18 +337,42 @@ def extract_embeddings(
     def flush() -> None:
         if not pending:
             return
-        waveforms = torch.stack([item.waveform for item in pending]).to(device)
-        lengths = torch.ones(waveforms.shape[0], device=device)
         with torch.inference_mode():
-            features = frontend.compute_features(waveforms)
-            normalized = frontend.mean_var_norm(features, lengths)
-            amp_context = (
-                torch.cuda.amp.autocast(dtype=torch.float16)
-                if device.type == "cuda"
-                else nullcontext()
-            )
-            with amp_context:
-                values = frontend.embedding_model(normalized, lengths).squeeze(1)
+            if device.type == "mps":
+                # SpeechBrain FBank includes STFT/Mel operations whose MPS
+                # support varies by torch/macOS version. Computing FBank on CPU
+                # is stable; only the small [B, 301, 80] tensor is transferred.
+                waveforms = torch.stack([item.waveform for item in pending])
+                features = frontend.compute_features(waveforms).to(device)
+                lengths = torch.ones(features.shape[0], device=device)
+                normalized = frontend.classifier.mods.mean_var_norm(
+                    features, lengths
+                )
+                values = frontend.classifier.mods.embedding_model(
+                    normalized, lengths
+                ).squeeze(1)
+            else:
+                waveforms = torch.stack(
+                    [item.waveform for item in pending]
+                ).to(device)
+                lengths = torch.ones(waveforms.shape[0], device=device)
+                features = frontend.compute_features(waveforms)
+                normalized = frontend.mean_var_norm(features, lengths)
+                amp_context = (
+                    torch.cuda.amp.autocast(dtype=torch.float16)
+                    if device.type == "cuda"
+                    else nullcontext()
+                )
+                with amp_context:
+                    values = frontend.embedding_model(
+                        normalized, lengths
+                    ).squeeze(1)
+            if values.ndim != 2 or values.shape[1] != 192:
+                raise RuntimeError(
+                    f"Unexpected embedding shape: {tuple(values.shape)}"
+                )
+            if not bool(torch.isfinite(values).all().item()):
+                raise RuntimeError("Embedding contains NaN or Inf")
             values = F.normalize(values.float(), p=2, dim=1).cpu()
         for item, vector in zip(pending, values):
             if item.segment_id in embeddings:
@@ -633,6 +680,8 @@ def evaluate(
             "invalid_source_recordings": len(invalid),
             "sample_rate": SAMPLE_RATE,
             "segment_samples": SEGMENT_SAMPLES,
+            "inference_device": str(device),
+            "fbank_device": "cpu" if device.type == "mps" else str(device),
         },
         "protocol": {
             "kind": "utterance_pair_cosine_verification",
