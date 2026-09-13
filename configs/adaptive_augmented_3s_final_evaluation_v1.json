@@ -1,10 +1,10 @@
 {
-  "schema_version": 1,
-  "identity_kind": "adaptive_augmented_3s_final_evaluation",
-  "checkpoint": {"path": "outputs/ecapa_aam_adaptive_augmented_3s_v1/best.pt", "sha256": "bfe49d9b96176d5c1dcc69c7275bd941a3c440ea57fe8458c53ebaab634ab5cc"},
-  "final_test_manifest": {"path": "manifests/adaptive_augmented_3s_v1_final_test_manifest.csv", "sha256": "73c1ce536b66266ef620de06f8e4fdca7777576934e032f5540aec444034a912"},
-  "trials": {"path": "manifests/verification/adaptive_augmented_3s_v1_final_test_trials.csv", "sha256": "e6d752a6dce0f3513482c713cf0375d2c99d7550d86e001ec5cf1bc674389427", "identity_path": "manifests/verification/adaptive_augmented_3s_v1_final_test_trials_identity.json", "identity_file_sha256": "deaa8c6e49a351c7bb33d34513f963a62fafe978b0e8d4e7cf69bd000f070685", "identity_sha256": "22a0d85241c91851bceb859c8bec0a3db598530a06c382bb89b8a47bc406e63a"},
-  "cache": {"path": "outputs/fbank_cache_adaptive_augmented_3s_v1_final_test", "identity_path": "outputs/fbank_cache_adaptive_augmented_3s_v1_final_test/fbank_cache_identity_adaptive_augmented_3s_v1_final_test.json", "identity_file_sha256": "8eeff3db3cdb280acf1bb7a58422ab0cbcd6767260127a6b21dc8a93f10d94cd", "identity_sha256": "a5af40586ac9fe2cec625be403371d28c1c21594cc8ca4b7ed6472aa65f3f535"},
-  "model": {"source": "speechbrain/spkrec-ecapa-voxceleb", "embedding_dim": 192, "feature_shape": [301, 80]},
-  "threshold_policy": "Final-test EER thresholds are descriptive only; deployment thresholds must be selected on validation."
+  "schema_version": 2,
+  "identity_kind": "generic_independent_final_test_evaluation",
+  "checkpoint": "outputs/ecapa_aam_adaptive_augmented_3s_v1/best.pt",
+  "cache_root": "outputs/fbank_cache_adaptive_augmented_3s_v1_final_test",
+  "output_dir": "outputs/ecapa_aam_adaptive_augmented_3s_v1/final_test",
+  "device": "cuda:0",
+  "batch_size": 64,
+  "threshold_policy": "The final-test EER threshold is descriptive only; select deployment thresholds on validation."
 }

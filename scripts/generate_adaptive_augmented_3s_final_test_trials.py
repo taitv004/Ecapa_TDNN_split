@@ -1,95 +1,221 @@
-"""Freeze the one-shot adaptive_augmented_3s_v1 final-test trial package."""
+#!/usr/bin/env python3
+"""Create a manifest and fixed verification trials for a separate test set.
+
+The test root must use ``<speaker_id>/<file>.wav``. It is never mixed into
+the train/validation split. By default this script also rejects speaker IDs
+that occur in the existing train/validation split CSV.
+"""
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
-import os
 import sys
-from collections import Counter
 from dataclasses import replace
-from pathlib import Path, PurePosixPath
+from pathlib import Path
+
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
+from scripts.create_adaptive_augmented_3s_package import (
+    PORTABLE_FIELDS,
+    canonical_json,
+    publish,
+    render_csv,
+    scan_dataset,
+)
 from src.adaptive_augmented_3s_verification import (
-    ValidationRow, ValidationTrial, generate_validation_trials, sha256_bytes,
-    sha256_file, trials_csv_bytes, validate_validation_trials,
+    ValidationRow,
+    generate_validation_trials,
+    sha256_bytes,
+    trials_csv_bytes,
 )
 
+
 MANIFEST = ROOT / "manifests/adaptive_augmented_3s_v1_final_test_manifest.csv"
-OUTPUT = ROOT / "manifests/verification"
-CSV = OUTPUT / "adaptive_augmented_3s_v1_final_test_trials.csv"
-IDENTITY = OUTPUT / "adaptive_augmented_3s_v1_final_test_trials_identity.json"
-MANIFEST_SHA256 = "73c1ce536b66266ef620de06f8e4fdca7777576934e032f5540aec444034a912"
+TRIALS = (
+    ROOT
+    / "manifests/verification/adaptive_augmented_3s_v1_final_test_trials.csv"
+)
+IDENTITY = (
+    ROOT
+    / "manifests/verification/"
+    "adaptive_augmented_3s_v1_final_test_trials_identity.json"
+)
+TRAIN_VALIDATION_SPLIT = (
+    ROOT / "splits/adaptive_augmented_3s_v1_speaker_split.csv"
+)
 
 
-def atomic_exact(path: Path, value: bytes) -> None:
-    if path.exists():
-        if path.read_bytes() != value:
-            raise FileExistsError(f"frozen artifact differs: {path}")
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_bytes(value)
-    os.replace(temporary, path)
-
-
-def atomic_replace(path: Path, value: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_bytes(value)
-    os.replace(temporary, path)
-
-
-def read_rows() -> tuple[ValidationRow, ...]:
-    rows: list[ValidationRow] = []
-    with MANIFEST.open("r", encoding="utf-8-sig", newline="") as stream:
+def read_train_validation_speakers(path: Path) -> set[str]:
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Missing train/validation split: {path}. "
+            "Create train/validation manifests first."
+        )
+    speakers: set[str] = set()
+    with path.open("r", encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
-        if tuple(reader.fieldnames or ()) != ("relative_audio_path", "speaker_id", "speaker_label", "final_split"):
-            raise ValueError("final-test manifest schema is invalid")
-        for line, row in enumerate(reader, 2):
-            path, speaker = row["relative_audio_path"].strip(), row["speaker_id"].strip()
-            pure = PurePosixPath(path)
-            if (not path or "\\" in path or pure.is_absolute() or ".." in pure.parts
-                    or pure.parent.name != speaker or row["speaker_label"].strip() != "-1"
-                    or row["final_split"].strip() != "final_test"):
-                raise ValueError(f"final-test manifest row {line} is invalid")
-            rows.append(ValidationRow(path, speaker))
-    if len(rows) != 6087 or len({row.audio_path for row in rows}) != 6087 or len({row.speaker_id for row in rows}) != 61:
-        raise ValueError("final-test manifest does not match the approved population")
-    return tuple(rows)
+        if not {"speaker_id", "split"}.issubset(reader.fieldnames or ()):
+            raise ValueError("Train/validation split CSV has an invalid schema")
+        for line, row in enumerate(reader, start=2):
+            speaker = row["speaker_id"].strip()
+            split = row["split"].strip()
+            if not speaker or split not in {"train", "validation"}:
+                raise ValueError(f"Invalid split row at line {line}")
+            if speaker in speakers:
+                raise ValueError(f"Duplicate speaker in split CSV: {speaker}")
+            speakers.add(speaker)
+    return speakers
+
+
+def create_test_package(
+    dataset_root: Path,
+    *,
+    seed: int,
+    genuine_trials: int,
+    impostor_trials: int,
+    overwrite: bool,
+    skip_audio_contract_check: bool,
+    allow_speaker_overlap: bool,
+) -> dict[str, object]:
+    rows = scan_dataset(dataset_root, skip_audio_contract_check)
+    test_speakers = {row.speaker_id for row in rows}
+    if len(test_speakers) < 2:
+        raise ValueError("The test set needs at least two speakers")
+    if not allow_speaker_overlap:
+        overlap = test_speakers & read_train_validation_speakers(
+            TRAIN_VALIDATION_SPLIT
+        )
+        if overlap:
+            raise ValueError(
+                "Speaker leakage between test and train/validation: "
+                + ", ".join(sorted(overlap)[:20])
+            )
+
+    manifest_rows = [
+        {
+            "relative_audio_path": row.audio_path,
+            "speaker_id": row.speaker_id,
+            "speaker_label": -1,
+            "final_split": "final_test",
+        }
+        for row in rows
+    ]
+    manifest_payload = render_csv(PORTABLE_FIELDS, manifest_rows)
+    verification_rows = tuple(
+        ValidationRow(row.audio_path, row.speaker_id) for row in rows
+    )
+    utterances_per_speaker: dict[str, int] = {}
+    for row in rows:
+        utterances_per_speaker[row.speaker_id] = (
+            utterances_per_speaker.get(row.speaker_id, 0) + 1
+        )
+    if genuine_trials == 0:
+        minimum_genuine_capacity = min(
+            count * (count - 1) // 2
+            for count in utterances_per_speaker.values()
+        )
+        genuine_trials = min(
+            10_000, len(test_speakers) * minimum_genuine_capacity
+        )
+    if impostor_trials == 0:
+        counts = list(utterances_per_speaker.values())
+        impostor_capacity = sum(
+            counts[left] * counts[right]
+            for left in range(len(counts))
+            for right in range(left + 1, len(counts))
+        )
+        # Keep headroom because endpoint-balanced speaker pairing can revisit
+        # one speaker pair before exhausting the global cross-speaker capacity.
+        impostor_trials = min(10_000, max(1, impostor_capacity // 2))
+    if genuine_trials < 1 or impostor_trials < 1:
+        raise ValueError(
+            "The test set does not contain enough recordings for both trial types"
+        )
+    generated = generate_validation_trials(
+        verification_rows,
+        seed=seed,
+        genuine_count=genuine_trials,
+        impostor_count=impostor_trials,
+    )
+    trials = tuple(
+        replace(
+            trial,
+            trial_id=f"adaptive-augmented-3s-v1-final-test-{index:05d}",
+        )
+        for index, trial in enumerate(generated)
+    )
+    trial_payload = trials_csv_bytes(trials)
+    identity = {
+        "schema_version": 2,
+        "identity_kind": "generic_independent_final_test",
+        "package_version": "adaptive_augmented_3s_v1",
+        "path_base": "independent_test_dataset_root",
+        "seed": seed,
+        "speaker_count": len(test_speakers),
+        "row_count": len(rows),
+        "speaker_disjoint_from_train_validation": not allow_speaker_overlap,
+        "manifest_sha256": sha256_bytes(manifest_payload),
+        "trial_counts": {
+            "genuine": genuine_trials,
+            "impostor": impostor_trials,
+            "total": genuine_trials + impostor_trials,
+        },
+        "trial_csv_sha256": sha256_bytes(trial_payload),
+    }
+    identity["identity_sha256"] = sha256_bytes(canonical_json(identity))
+    publish(MANIFEST, manifest_payload, overwrite)
+    publish(TRIALS, trial_payload, overwrite)
+    publish(IDENTITY, canonical_json(identity), overwrite)
+    return {
+        "result": "PASS",
+        "test_speakers": len(test_speakers),
+        "test_rows": len(rows),
+        "trials": identity["trial_counts"],
+        "speaker_overlap": 0 if not allow_speaker_overlap else "not_checked",
+        "manifest": str(MANIFEST),
+        "trial_csv": str(TRIALS),
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset-root", type=Path, required=True)
+    parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument(
+        "--genuine-trials", type=int, default=0,
+        help="0 chooses the largest safe value up to 10000.",
+    )
+    parser.add_argument(
+        "--impostor-trials", type=int, default=0,
+        help="0 chooses the largest safe value up to 10000.",
+    )
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--skip-audio-contract-check", action="store_true")
+    parser.add_argument(
+        "--allow-speaker-overlap",
+        action="store_true",
+        help="Disable the default train/validation speaker-overlap rejection.",
+    )
+    return parser.parse_args()
 
 
 def main() -> None:
-    if sha256_file(MANIFEST) != MANIFEST_SHA256:
-        raise ValueError("approved final-test manifest hash mismatch")
-    rows = read_rows()
-    generated = generate_validation_trials(rows, seed=2026)
-    trials = tuple(replace(trial, trial_id=f"adaptive-augmented-3s-v1-final-test-{index:05d}") for index, trial in enumerate(generated))
-    validate_validation_trials(trials, rows)
-    payload = trials_csv_bytes(trials)
-    genuine_participation = Counter(trial.left_speaker_id for trial in trials if trial.target == 1)
-    impostor_endpoints = Counter()
-    for trial in trials:
-        if trial.target == 0:
-            impostor_endpoints.update((trial.left_speaker_id, trial.right_speaker_id))
-    identity = {
-        "schema_version": 1, "identity_kind": "adaptive_augmented_3s_final_test_trials",
-        "package_version": "adaptive_augmented_3s_v1", "generation_algorithm": "hash_ranked_genuine_and_balanced_impostor_endpoints_v1",
-        "seed": 2026, "input_split": "final_test", "final_test_manifest": {"path": MANIFEST.relative_to(ROOT).as_posix(), "sha256": MANIFEST_SHA256},
-        "speaker_count": 61, "trial_counts": {"genuine": 10000, "impostor": 10000, "total": 20000},
-        "trial_csv_path": CSV.relative_to(ROOT).as_posix(), "trial_csv_sha256": sha256_bytes(payload),
-        "trial_schema": ["trial_id", "left_audio_path", "right_audio_path", "left_speaker_id", "right_speaker_id", "target"],
-        "pair_identity": "canonical_unordered_dataset_relative_audio_paths", "frozen": True, "timestamps_in_identity": False,
-        "genuine_trial_participation": dict(sorted(genuine_participation.items())),
-        "impostor_endpoint_participation": dict(sorted(impostor_endpoints.items())),
-    }
-    identity["identity_sha256"] = sha256_bytes(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8"))
-    atomic_exact(CSV, payload)
-    atomic_replace(IDENTITY, (json.dumps(identity, indent=2, sort_keys=True) + "\n").encode("utf-8"))
-    print(json.dumps({"trials": len(trials), "trial_csv_sha256": identity["trial_csv_sha256"], "trial_identity_sha256": identity["identity_sha256"]}, sort_keys=True))
+    args = parse_args()
+    result = create_test_package(
+        args.dataset_root,
+        seed=args.seed,
+        genuine_trials=args.genuine_trials,
+        impostor_trials=args.impostor_trials,
+        overwrite=args.overwrite,
+        skip_audio_contract_check=args.skip_audio_contract_check,
+        allow_speaker_overlap=args.allow_speaker_overlap,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

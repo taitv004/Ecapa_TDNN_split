@@ -1,93 +1,155 @@
-"""Build the isolated final-test raw SpeechBrain Fbank cache; never score it."""
+#!/usr/bin/env python3
+"""Build a resumable raw-FBank cache for the independent final-test set."""
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
+import math
 import sys
 from pathlib import Path, PurePosixPath
 
+import torch
+
+
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import scripts.build_adaptive_augmented_3s_fbank_cache as base
-
-FINAL_MANIFEST = "manifests/adaptive_augmented_3s_v1_final_test_manifest.csv"
-FINAL_SHA256 = "73c1ce536b66266ef620de06f8e4fdca7777576934e032f5540aec444034a912"
-
-base.SPLITS = ("final_test",)
-base.EXPECTED_ROWS = {"final_test": 6087}
-base.EXPECTED_SPEAKERS = {"final_test": 61}
-base.CACHE_VERSION = "adaptive_augmented_3s_v1_final_test"
-base.CONFIG_FILENAME = "fbank_cache_config_adaptive_augmented_3s_v1_final_test.json"
-base.IDENTITY_FILENAME = "fbank_cache_identity_adaptive_augmented_3s_v1_final_test.json"
-base.RUNTIME_FILENAME = "fbank_cache_runtime_adaptive_augmented_3s_v1_final_test.json"
-base.INDEX_FILENAMES = {"final_test": "final_test_feature_index_adaptive_augmented_3s_v1.csv"}
+from src.speechbrain_frontend import SpeechBrainECAPAFrontend
 
 
-def validate_inputs():
-    path = ROOT / FINAL_MANIFEST
-    actual = base.sha256_file(path)
-    if actual != FINAL_SHA256:
-        raise ValueError("approved final-test manifest hash mismatch")
-    rows, seen = [], set()
-    with path.open("r", encoding="utf-8-sig", newline="") as stream:
+MANIFEST = ROOT / "manifests/adaptive_augmented_3s_v1_final_test_manifest.csv"
+CONFIG_FILENAME = "fbank_cache_config_adaptive_augmented_3s_v1_final_test.json"
+IDENTITY_FILENAME = "fbank_cache_identity_adaptive_augmented_3s_v1_final_test.json"
+INDEX_FILENAME = "final_test_feature_index_adaptive_augmented_3s_v1.csv"
+
+
+def read_manifest() -> list[base.SourceRow]:
+    rows: list[base.SourceRow] = []
+    seen: set[str] = set()
+    with MANIFEST.open("r", encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
-        if tuple(reader.fieldnames or ()) != base.PORTABLE_FIELDS:
-            raise ValueError("final-test manifest schema is invalid")
+        if tuple(reader.fieldnames or ()) != base.MANIFEST_FIELDS:
+            raise ValueError("Invalid final-test manifest schema")
         for index, raw in enumerate(reader):
-            relative = base.safe_relative_path(raw["relative_audio_path"].strip(), "audio path")
+            relative = base.safe_path(raw["relative_audio_path"].strip())
             speaker = raw["speaker_id"].strip()
-            if (not speaker or relative in seen or PurePosixPath(relative).parent.name != speaker
-                    or raw["speaker_label"].strip() != "-1" or raw["final_split"].strip() != "final_test"):
-                raise ValueError(f"final-test manifest row {index + 2} is invalid")
+            if (
+                relative in seen
+                or PurePosixPath(relative).parent.name != speaker
+                or raw["speaker_label"].strip() != "-1"
+                or raw["final_split"].strip() != "final_test"
+            ):
+                raise ValueError(f"Invalid final-test row at line {index + 2}")
             seen.add(relative)
             rows.append(base.SourceRow(relative, speaker, -1, "final_test", index))
-    if len(rows) != 6087 or len({row.speaker_id for row in rows}) != 61:
-        raise ValueError("final-test manifest count does not match approval")
-    return {"final_test_manifest": {"path": FINAL_MANIFEST, "sha256": actual}}, {"final_test": rows}
+    if not rows or len({row.speaker_id for row in rows}) < 2:
+        raise ValueError("Final test needs at least two speakers")
+    return rows
 
 
 def main() -> None:
-    parser = base.argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", required=True, type=Path)
     parser.add_argument("--cache-root", required=True, type=Path)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch-size", default=64, type=int)
-    parser.add_argument("--shard-size", default=512, type=int)
+    parser.add_argument("--shard-size", default=256, type=int)
     args = parser.parse_args()
     if args.batch_size < 1 or args.shard_size < 1:
-        raise ValueError("batch size and shard size must be positive")
-    dataset_root, cache_root = args.dataset_root.resolve(strict=True), args.cache_root.resolve()
-    if cache_root.parent != ROOT / "outputs":
-        raise ValueError("final-test cache root must be directly under outputs/")
-    bindings, rows = validate_inputs()
-    config = base.cache_config(bindings, args.shard_size, args.batch_size)
-    config.update({"identity_kind": "adaptive_augmented_3s_final_test_fbank_cache_config", "included_splits": ["final_test"], "expected_rows": {"final_test": 6087}, "evaluation_label": -1, "final_test_cache_only": True})
-    config.pop("train_class_count", None); config.pop("train_label_range", None); config.pop("validation_label", None)
-    base.check_no_absolute_dataset_root(config, dataset_root)
-    indexes = {"final_test": base.index_text(rows["final_test"], "final_test", args.shard_size)}
-    complete = base.prepare_plan(cache_root, base.canonical_json(config), indexes)
-    frontend = base.SpeechBrainECAPAFrontend(device=args.device)
-    source_before = base.source_state(dataset_root, rows)
-    extraction = {"final_test": {"written": 0, "reused": 0, "total": 0}} if complete else base.extract_cache(frontend, dataset_root, cache_root, rows, args.shard_size, args.batch_size)
-    validation = base.validate_complete_cache(cache_root, rows, indexes, args.shard_size)
-    if source_before != base.source_state(dataset_root, rows):
-        raise RuntimeError("source audio changed during final-test cache construction")
-    validation["final_test_cached_entries"] = validation["total_cached_utterances"]
-    identity = base.build_identity(bindings, cache_root / base.CONFIG_FILENAME, cache_root, validation)
-    identity.update({"identity_kind": "adaptive_augmented_3s_final_test_fbank_cache", "final_test_cache_absent": False, "final_test_cache_only": True})
-    identity["identity_sha256"] = base.canonical_digest({key: value for key, value in identity.items() if key != "identity_sha256"})
-    base.atomic_text(cache_root / base.IDENTITY_FILENAME, base.canonical_json(identity))
-    compatibility = base.fresh_vs_cached(frontend, dataset_root, cache_root, rows, args.shard_size)
-    first_payload = base.torch.load(cache_root / "final_test" / "shard_00000.pt", map_location="cpu", weights_only=False)
-    first_features = first_payload["features"][:4]
-    if (tuple(first_features.shape) != (4, 301, 80) or first_features.dtype != base.torch.float32
-            or not bool(base.torch.isfinite(first_features).all().item())
-            or first_payload["final_split"] != "final_test" or first_payload["speaker_labels"][:4].tolist() != [-1] * 4):
-        raise ValueError("final-test cache mini-batch check failed")
-    dataset_check = {"final_test": {"batch_shape": list(first_features.shape), "labels": first_payload["speaker_labels"][:4].tolist()}}
-    print(json.dumps({"identity_sha256": identity["identity_sha256"], "cache_count": validation["total_cached_utterances"], "extraction": extraction, "compatibility": compatibility, "dataset_check": dataset_check}, sort_keys=True))
+        raise ValueError("batch-size and shard-size must be positive")
+
+    dataset_root = args.dataset_root.expanduser().resolve(strict=True)
+    cache_root = args.cache_root.expanduser().resolve()
+    rows = read_manifest()
+    binding = {
+        "final_test_manifest": {
+            "path": MANIFEST.relative_to(ROOT).as_posix(),
+            "sha256": base.sha256_file(MANIFEST),
+        }
+    }
+    config = {
+        "schema_version": 4,
+        "cache_version": "adaptive_augmented_3s_v1_generic_final_test",
+        "model_source": SpeechBrainECAPAFrontend.SOURCE,
+        "input_bindings": binding,
+        "included_splits": ["final_test"],
+        "feature_stage": "raw_compute_features_before_mean_var_norm",
+        "feature_shape": list(base.FEATURE_SHAPE),
+        "feature_dtype": "float32",
+        "raw_pre_normalization": True,
+        "transposed": False,
+        "shard_size": args.shard_size,
+        "extraction_batch_size": args.batch_size,
+        "expected_rows": {"final_test": len(rows)},
+        "evaluation_label": -1,
+        "index_filename": INDEX_FILENAME,
+    }
+    cache_root.mkdir(parents=True, exist_ok=True)
+    config_path = cache_root / CONFIG_FILENAME
+    config_payload = base.canonical_json(config)
+    if config_path.exists() and config_path.read_bytes() != config_payload:
+        raise ValueError("Existing final-test cache has another config")
+    base.atomic_bytes(config_path, config_payload)
+    index_payload = base.render_index(rows, "final_test", args.shard_size)
+    index_path = cache_root / INDEX_FILENAME
+    if index_path.exists() and index_path.read_bytes() != index_payload:
+        raise ValueError("Existing final-test cache index conflicts")
+    base.atomic_bytes(index_path, index_payload)
+
+    base.SPLITS = ("final_test",)
+    frontend = SpeechBrainECAPAFrontend(device=args.device)
+    frontend.eval()
+    outcome = base.build_cache(
+        frontend,
+        dataset_root,
+        cache_root,
+        {"final_test": rows},
+        args.shard_size,
+        args.batch_size,
+    )
+    expected_shards = math.ceil(len(rows) / args.shard_size)
+    actual_shards = len(list((cache_root / "final_test").glob("shard_*.pt")))
+    if actual_shards != expected_shards:
+        raise RuntimeError("Final-test shard count is incomplete")
+    first = torch.load(
+        cache_root / "final_test/shard_00000.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    if tuple(first["features"].shape[1:]) != base.FEATURE_SHAPE:
+        raise ValueError("Final-test FBank shape is invalid")
+    identity = {
+        "schema_version": 4,
+        "identity_kind": "generic_final_test_fbank_cache",
+        "cache_version": config["cache_version"],
+        "config_path": CONFIG_FILENAME,
+        "config_sha256": base.sha256_file(config_path),
+        "input_bindings": binding,
+        "row_count": len(rows),
+        "speaker_count": len({row.speaker_id for row in rows}),
+        "feature_shape": list(base.FEATURE_SHAPE),
+        "shard_size": args.shard_size,
+        "index_sha256": base.sha256_file(index_path),
+    }
+    identity["identity_sha256"] = base.canonical_digest(identity)
+    base.atomic_bytes(cache_root / IDENTITY_FILENAME, base.canonical_json(identity))
+    print(
+        json.dumps(
+            {
+                "result": "PASS",
+                "rows": len(rows),
+                "speakers": identity["speaker_count"],
+                "shards": outcome,
+                "identity_sha256": identity["identity_sha256"],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
 
 
 if __name__ == "__main__":
