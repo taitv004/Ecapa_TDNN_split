@@ -24,11 +24,16 @@ from src.aam_training import (
     build_adamw_optimizer,
 )
 from src.adaptive_augmented_3s_verification import (
+    MANIFEST_FIELDS,
     TRIAL_FIELDS,
     ValidationRow,
     ValidationTrial,
     sha256_file,
     validate_validation_trials,
+)
+from src.adaptive_augmented_3s_package import (
+    read_common_manifest,
+    validate_training_rows,
 )
 from src.speechbrain_frontend import SpeechBrainECAPAFrontend
 from src.verification_metrics import calculate_eer
@@ -38,22 +43,8 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CACHE_ROOT = ROOT / "outputs/fbank_cache_adaptive_augmented_3s_v1"
 DEFAULT_CONFIG = ROOT / "configs/adaptive_augmented_3s_training_v1.json"
 DEFAULT_OUTPUT = ROOT / "outputs/ecapa_aam_adaptive_augmented_3s_v1"
-TRAIN_MANIFEST = ROOT / "manifests/adaptive_augmented_3s_v1_train_manifest.csv"
-VALIDATION_MANIFEST = (
-    ROOT / "manifests/adaptive_augmented_3s_v1_validation_manifest.csv"
-)
-VALIDATION_TRIALS = (
-    ROOT
-    / "manifests/verification/adaptive_augmented_3s_v1_validation_trials.csv"
-)
 CACHE_CONFIG_NAME = "fbank_cache_config_adaptive_augmented_3s_v1.json"
 CACHE_IDENTITY_NAME = "fbank_cache_identity_adaptive_augmented_3s_v1.json"
-MANIFEST_FIELDS = (
-    "relative_audio_path",
-    "speaker_id",
-    "speaker_label",
-    "final_split",
-)
 FEATURE_SHAPE = (301, 80)
 EMBEDDING_DIM = 192
 
@@ -87,18 +78,26 @@ def atomic_save(path: Path, value: Mapping[str, Any]) -> None:
 
 def read_manifest(path: Path, split: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen_samples: set[str] = set()
+    seen_paths: set[str] = set()
     with path.open("r", encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
         if tuple(reader.fieldnames or ()) != MANIFEST_FIELDS:
             raise ValueError(f"Invalid manifest schema: {path}")
         for line, raw in enumerate(reader, start=2):
             relative = raw["relative_audio_path"].strip()
+            sample_id = raw["sample_id"].strip()
+            source_dataset = raw["source_dataset"].strip()
+            source_recording_id = raw["source_recording_id"].strip()
             speaker = raw["speaker_id"].strip()
             label = int(raw["speaker_label"])
             if (
                 not relative
-                or relative in seen
+                or not sample_id
+                or not source_dataset
+                or not source_recording_id
+                or relative in seen_paths
+                or sample_id in seen_samples
                 or not speaker
                 or raw["final_split"].strip() != split
             ):
@@ -107,10 +106,14 @@ def read_manifest(path: Path, split: str) -> list[dict[str, Any]]:
                 raise ValueError(f"Negative train label at {path}:{line}")
             if split in {"validation", "final_test"} and label != -1:
                 raise ValueError(f"Evaluation label must be -1 at {path}:{line}")
-            seen.add(relative)
+            seen_paths.add(relative)
+            seen_samples.add(sample_id)
             rows.append(
                 {
+                    "sample_id": sample_id,
                     "relative_audio_path": relative,
+                    "source_dataset": source_dataset,
+                    "source_recording_id": source_recording_id,
                     "speaker_id": speaker,
                     "speaker_label": label,
                     "final_split": split,
@@ -131,8 +134,8 @@ def read_trials(path: Path) -> tuple[ValidationTrial, ...]:
             trials.append(
                 ValidationTrial(
                     raw["trial_id"],
-                    raw["left_audio_path"],
-                    raw["right_audio_path"],
+                    raw["left_sample_id"],
+                    raw["right_sample_id"],
                     raw["left_speaker_id"],
                     raw["right_speaker_id"],
                     int(raw["target"]),
@@ -185,13 +188,18 @@ class CachedDataset(Dataset[dict[str, Any]]):
         row = self.rows[index]
         shard_number, offset = divmod(index, self.shard_size)
         shard = self._load_shard(shard_number)
-        if shard["relative_audio_paths"][offset] != row["relative_audio_path"]:
+        if (
+            shard["sample_ids"][offset] != row["sample_id"]
+            or shard["relative_audio_paths"][offset]
+            != row["relative_audio_path"]
+        ):
             raise ValueError("Cache and manifest row order disagree")
         feature = shard["features"][offset]
         if tuple(feature.shape) != FEATURE_SHAPE or feature.dtype != torch.float32:
             raise ValueError("Invalid cached FBank tensor")
         return {
             "fbank": feature,
+            "sample_id": row["sample_id"],
             "speaker_label": int(shard["speaker_labels"][offset]),
             "speaker_id": row["speaker_id"],
             "relative_audio_path": row["relative_audio_path"],
@@ -206,6 +214,7 @@ def collate(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "speaker_label": torch.tensor(
             [sample["speaker_label"] for sample in samples], dtype=torch.long
         ),
+        "sample_id": [sample["sample_id"] for sample in samples],
         "speaker_id": [sample["speaker_id"] for sample in samples],
         "relative_audio_path": [
             sample["relative_audio_path"] for sample in samples
@@ -351,6 +360,8 @@ def cosine_factor(step: int, total_steps: int, minimum: float) -> float:
 def load_configuration(
     config_path: Path,
     cache_root: Path,
+    manifest_path: Path,
+    trials_path: Path,
     train_rows: Sequence[Mapping[str, Any]],
     validation_rows: Sequence[Mapping[str, Any]],
     trial_count: int,
@@ -411,21 +422,21 @@ def load_configuration(
     cache_identity_path = cache_root / CACHE_IDENTITY_NAME
     cache_config = json.loads(cache_config_path.read_text(encoding="utf-8"))
     cache_identity = json.loads(cache_identity_path.read_text(encoding="utf-8"))
-    current_manifest_hashes = {
-        "train_manifest": sha256_file(TRAIN_MANIFEST),
-        "validation_manifest": sha256_file(VALIDATION_MANIFEST),
-    }
     cached_bindings = cache_config.get("input_bindings", {})
+    label_mapping = {
+        str(row["speaker_id"]): int(row["speaker_label"])
+        for row in train_rows
+    }
     if (
         cache_config.get("expected_rows")
         != {"train": len(train_rows), "validation": len(validation_rows)}
         or cache_config.get("train_class_count") != classes
         or cache_config.get("feature_shape") != list(FEATURE_SHAPE)
         or cache_identity.get("config_sha256") != sha256_file(cache_config_path)
-        or any(
-            cached_bindings.get(name, {}).get("sha256") != digest
-            for name, digest in current_manifest_hashes.items()
-        )
+        or cached_bindings.get("authoritative_manifest", {}).get("sha256")
+        != sha256_file(manifest_path)
+        or cached_bindings.get("speaker_to_label_sha256")
+        != canonical_digest(label_mapping)
         or cache_identity.get("input_bindings") != cached_bindings
     ):
         raise ValueError("Cache identity/counts disagree with current manifests")
@@ -445,9 +456,8 @@ def load_configuration(
     binding = {
         "configuration_sha256": canonical_digest(runtime),
         "cache_identity_sha256": cache_identity["identity_sha256"],
-        "train_manifest_sha256": sha256_file(TRAIN_MANIFEST),
-        "validation_manifest_sha256": sha256_file(VALIDATION_MANIFEST),
-        "validation_trials_sha256": sha256_file(VALIDATION_TRIALS),
+        "authoritative_manifest_sha256": sha256_file(manifest_path),
+        "validation_trials_sha256": sha256_file(trials_path),
     }
     return runtime, binding
 
@@ -516,7 +526,7 @@ def evaluate_validation(
             ):
                 value = embedding_model(normalized, lengths).squeeze(1).float()
             value = F.normalize(value, p=2, dim=1).cpu()
-            embeddings.update(zip(batch["relative_audio_path"], value))
+            embeddings.update(zip(batch["sample_id"], value))
             if batch_number % 25 == 0 or batch_number == len(loader):
                 print(
                     f"VALIDATION batch={batch_number}/{len(loader)}", flush=True
@@ -526,11 +536,13 @@ def evaluate_validation(
     for trial in trials:
         try:
             score = torch.dot(
-                embeddings[trial.left_audio_path],
-                embeddings[trial.right_audio_path],
+                embeddings[trial.left_sample_id],
+                embeddings[trial.right_sample_id],
             )
         except KeyError as error:
-            raise ValueError(f"Trial path missing from validation cache: {error}") from error
+            raise ValueError(
+                f"Trial sample ID missing from validation cache: {error}"
+            ) from error
         scores.append(float(score))
         targets.append(trial.target)
     result = calculate_eer(scores, targets)
@@ -544,6 +556,8 @@ def evaluate_validation(
 def run_training(
     *,
     config_path: Path,
+    manifest_path: Path,
+    trials_path: Path,
     cache_root: Path,
     output_dir: Path,
     device_name: str,
@@ -553,15 +567,19 @@ def run_training(
     if device_name.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
     device = torch.device(device_name)
-    train_rows = read_manifest(TRAIN_MANIFEST, "train")
-    validation_rows = read_manifest(VALIDATION_MANIFEST, "validation")
-    if {row["speaker_id"] for row in train_rows} & {
-        row["speaker_id"] for row in validation_rows
-    }:
-        raise ValueError("Speaker leakage between train and validation")
-    trials = read_trials(VALIDATION_TRIALS)
+    mapped_rows, labels, manifest_summary = read_common_manifest(manifest_path)
+    validate_training_rows(mapped_rows, labels)
+    train_rows = mapped_rows["train"]
+    validation_rows = mapped_rows["validation"]
+    trials = read_trials(trials_path)
     trial_rows = tuple(
-        ValidationRow(row["relative_audio_path"], row["speaker_id"])
+        ValidationRow(
+            row["sample_id"],
+            row["relative_audio_path"],
+            row["speaker_id"],
+            row["source_dataset"],
+            row["source_recording_id"],
+        )
         for row in validation_rows
     )
     validate_validation_trials(
@@ -571,7 +589,20 @@ def run_training(
         impostor_count=sum(trial.target == 0 for trial in trials),
     )
     config, binding = load_configuration(
-        config_path, cache_root, train_rows, validation_rows, len(trials)
+        config_path,
+        cache_root,
+        manifest_path,
+        trials_path,
+        train_rows,
+        validation_rows,
+        len(trials),
+    )
+    print(
+        "MANIFEST "
+        f"train_speakers={manifest_summary['speaker_counts']['train']} "
+        f"validation_speakers={manifest_summary['speaker_counts']['validation']} "
+        f"train_rows={len(train_rows)} validation_rows={len(validation_rows)}",
+        flush=True,
     )
     cache_config = json.loads(
         (cache_root / CACHE_CONFIG_NAME).read_text(encoding="utf-8")
@@ -604,7 +635,7 @@ def run_training(
 
     def checkpoint_payload(reason: str) -> dict[str, Any]:
         return {
-            "schema": "generic_ecapa_aam_training_v2",
+            "schema": "generic_ecapa_aam_training_v3",
             "reason": reason,
             "binding": binding,
             "runtime_config": config,
@@ -627,7 +658,7 @@ def run_training(
     if resume is not None:
         checkpoint = torch.load(resume, map_location="cpu", weights_only=False)
         if (
-            checkpoint.get("schema") != "generic_ecapa_aam_training_v2"
+            checkpoint.get("schema") != "generic_ecapa_aam_training_v3"
             or checkpoint.get("binding") != binding
             or checkpoint.get("runtime_config") != config
         ):
@@ -810,6 +841,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--run", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        required=True,
+        help="Frozen 22-column common manifest.csv.",
+    )
+    parser.add_argument(
+        "--validation-trials",
+        type=Path,
+        required=True,
+        help="Frozen sample-ID validation trial CSV.",
+    )
     parser.add_argument("--cache-root", type=Path, default=DEFAULT_CACHE_ROOT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--resume", type=Path)
@@ -818,6 +861,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.run == args.dry_run:
         parser.error("Specify exactly one of --run or --dry-run")
     config_path = args.config.expanduser().resolve(strict=True)
+    manifest_path = args.manifest.expanduser().resolve(strict=True)
+    trials_path = args.validation_trials.expanduser().resolve(strict=True)
     cache_root = args.cache_root.expanduser().resolve(strict=True)
     output_dir = args.output_dir.expanduser().resolve()
     if args.dry_run:
@@ -825,6 +870,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error("--dry-run does not accept --resume")
         first = run_training(
             config_path=config_path,
+            manifest_path=manifest_path,
+            trials_path=trials_path,
             cache_root=cache_root,
             output_dir=output_dir,
             device_name=args.device,
@@ -833,6 +880,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         second = run_training(
             config_path=config_path,
+            manifest_path=manifest_path,
+            trials_path=trials_path,
             cache_root=cache_root,
             output_dir=output_dir,
             device_name=args.device,
@@ -843,6 +892,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         result = run_training(
             config_path=config_path,
+            manifest_path=manifest_path,
+            trials_path=trials_path,
             cache_root=cache_root,
             output_dir=output_dir,
             device_name=args.device,

@@ -8,7 +8,7 @@ import csv
 import json
 import math
 import sys
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 import torch
 
@@ -29,23 +29,43 @@ INDEX_FILENAME = "final_test_feature_index_adaptive_augmented_3s_v1.csv"
 
 def read_manifest() -> list[base.SourceRow]:
     rows: list[base.SourceRow] = []
-    seen: set[str] = set()
+    seen_samples: set[str] = set()
+    seen_paths: set[str] = set()
     with MANIFEST.open("r", encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
         if tuple(reader.fieldnames or ()) != base.MANIFEST_FIELDS:
             raise ValueError("Invalid final-test manifest schema")
         for index, raw in enumerate(reader):
             relative = base.safe_path(raw["relative_audio_path"].strip())
+            sample_id = raw["sample_id"].strip()
+            source_dataset = raw["source_dataset"].strip()
+            source_recording_id = raw["source_recording_id"].strip()
             speaker = raw["speaker_id"].strip()
             if (
-                relative in seen
-                or PurePosixPath(relative).parent.name != speaker
+                not sample_id
+                or not source_dataset
+                or not source_recording_id
+                or relative in seen_paths
+                or sample_id in seen_samples
+                or not speaker
                 or raw["speaker_label"].strip() != "-1"
                 or raw["final_split"].strip() != "final_test"
             ):
                 raise ValueError(f"Invalid final-test row at line {index + 2}")
-            seen.add(relative)
-            rows.append(base.SourceRow(relative, speaker, -1, "final_test", index))
+            seen_samples.add(sample_id)
+            seen_paths.add(relative)
+            rows.append(
+                base.SourceRow(
+                    sample_id,
+                    relative,
+                    source_dataset,
+                    source_recording_id,
+                    speaker,
+                    -1,
+                    "final_test",
+                    index,
+                )
+            )
     if not rows or len({row.speaker_id for row in rows}) < 2:
         raise ValueError("Final test needs at least two speakers")
     return rows
@@ -72,7 +92,7 @@ def main() -> None:
         }
     }
     config = {
-        "schema_version": 4,
+        "schema_version": 5,
         "cache_version": "adaptive_augmented_3s_v1_generic_final_test",
         "model_source": SpeechBrainECAPAFrontend.SOURCE,
         "input_bindings": binding,
@@ -123,7 +143,7 @@ def main() -> None:
     if tuple(first["features"].shape[1:]) != base.FEATURE_SHAPE:
         raise ValueError("Final-test FBank shape is invalid")
     identity = {
-        "schema_version": 4,
+        "schema_version": 5,
         "identity_kind": "generic_final_test_fbank_cache",
         "cache_version": config["cache_version"],
         "config_path": CONFIG_FILENAME,

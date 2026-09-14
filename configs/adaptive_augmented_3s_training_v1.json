@@ -8,7 +8,7 @@
     "speakers_per_batch": 16,
     "samples_per_speaker": 2,
     "active_shard_window": 8,
-    "batches_per_epoch": 1520
+    "batches_per_epoch": "auto"
   },
   "model": {
     "source": "speechbrain/spkrec-ecapa-voxceleb",

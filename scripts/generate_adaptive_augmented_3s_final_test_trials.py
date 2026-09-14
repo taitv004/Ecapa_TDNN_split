@@ -12,7 +12,8 @@ import argparse
 import csv
 import json
 import sys
-from dataclasses import replace
+import wave
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 
@@ -21,13 +22,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.create_adaptive_augmented_3s_package import (
-    PORTABLE_FIELDS,
     canonical_json,
     publish,
     render_csv,
-    scan_dataset,
 )
 from src.adaptive_augmented_3s_verification import (
+    MANIFEST_FIELDS,
     ValidationRow,
     generate_validation_trials,
     sha256_bytes,
@@ -48,6 +48,46 @@ IDENTITY = (
 TRAIN_VALIDATION_SPLIT = (
     ROOT / "splits/adaptive_augmented_3s_v1_speaker_split.csv"
 )
+
+
+@dataclass(frozen=True)
+class TestAudioRow:
+    audio_path: str
+    speaker_id: str
+
+
+def scan_test_dataset(
+    dataset_root: Path, skip_audio_contract_check: bool
+) -> list[TestAudioRow]:
+    root = dataset_root.expanduser().resolve(strict=True)
+    wavs = sorted(
+        (path for path in root.rglob("*.wav") if path.is_file()),
+        key=lambda path: path.relative_to(root).as_posix().casefold(),
+    )
+    if not wavs:
+        raise ValueError(f"No WAV files found under {root}")
+    rows: list[TestAudioRow] = []
+    for path in wavs:
+        relative = path.relative_to(root).as_posix()
+        speaker = path.parent.name
+        if not speaker:
+            raise ValueError(f"Cannot derive test speaker from {relative}")
+        if not skip_audio_contract_check:
+            try:
+                with wave.open(str(path), "rb") as stream:
+                    actual = (
+                        stream.getframerate(),
+                        stream.getnchannels(),
+                        stream.getnframes(),
+                    )
+            except (OSError, EOFError, wave.Error) as error:
+                raise ValueError(f"Cannot read test WAV {relative}: {error}") from error
+            if actual != (16_000, 1, 48_000):
+                raise ValueError(
+                    f"Expected mono 16 kHz/3 s test WAV, got {actual}: {relative}"
+                )
+        rows.append(TestAudioRow(relative, speaker))
+    return rows
 
 
 def read_train_validation_speakers(path: Path) -> set[str]:
@@ -82,7 +122,7 @@ def create_test_package(
     skip_audio_contract_check: bool,
     allow_speaker_overlap: bool,
 ) -> dict[str, object]:
-    rows = scan_dataset(dataset_root, skip_audio_contract_check)
+    rows = scan_test_dataset(dataset_root, skip_audio_contract_check)
     test_speakers = {row.speaker_id for row in rows}
     if len(test_speakers) < 2:
         raise ValueError("The test set needs at least two speakers")
@@ -98,16 +138,27 @@ def create_test_package(
 
     manifest_rows = [
         {
+            "sample_id": "external-test-"
+            + sha256_bytes(row.audio_path.encode("utf-8"))[:24],
             "relative_audio_path": row.audio_path,
+            "source_dataset": "external_test",
+            "source_recording_id": row.audio_path,
             "speaker_id": row.speaker_id,
             "speaker_label": -1,
             "final_split": "final_test",
         }
         for row in rows
     ]
-    manifest_payload = render_csv(PORTABLE_FIELDS, manifest_rows)
+    manifest_payload = render_csv(MANIFEST_FIELDS, manifest_rows)
     verification_rows = tuple(
-        ValidationRow(row.audio_path, row.speaker_id) for row in rows
+        ValidationRow(
+            manifest["sample_id"],
+            row.audio_path,
+            row.speaker_id,
+            "external_test",
+            row.audio_path,
+        )
+        for row, manifest in zip(rows, manifest_rows)
     )
     utterances_per_speaker: dict[str, int] = {}
     for row in rows:

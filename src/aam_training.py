@@ -19,7 +19,7 @@ CHECKPOINT_SCHEMA_NAME = "speaker_verification_aam_training_smoke"
 CHECKPOINT_SCHEMA_VERSION = 1
 PRETRAINED_MODEL_ID = "speechbrain/spkrec-ecapa-voxceleb"
 EMBEDDING_DIM = 192
-NUM_CLASSES = 488
+LEGACY_SMOKE_NUM_CLASSES = 488
 SEED = 20260727
 APPROVED_TRAIN_CACHE_RELATIVE = Path("outputs/fbank_cache_v1")
 APPROVED_TRAIN_INDEX_FILENAME = "train_feature_index_v1.csv"
@@ -156,12 +156,14 @@ class AAMSoftmax(nn.Module):
     def __init__(
         self,
         embedding_dim: int = EMBEDDING_DIM,
-        num_classes: int = NUM_CLASSES,
+        num_classes: int | None = None,
         margin: float = 0.2,
         scale: float = 30.0,
         seed: int = SEED,
     ) -> None:
         super().__init__()
+        if num_classes is None:
+            raise ValueError("num_classes must be derived from the train manifest")
         if embedding_dim < 1 or num_classes < 2:
             raise ValueError("embedding_dim and num_classes must be positive")
         if not math.isfinite(margin) or not 0.0 <= margin < math.pi / 2:
@@ -685,7 +687,7 @@ def validate_checkpoint_v1(checkpoint: Mapping[str, Any]) -> None:
         raise ValueError("checkpoint microbatch configuration is invalid")
     if checkpoint["aam"] != {
         "embedding_dim": EMBEDDING_DIM,
-        "num_classes": NUM_CLASSES,
+        "num_classes": LEGACY_SMOKE_NUM_CLASSES,
         "margin_radians": 0.2,
         "scale": 30.0,
         "initialization_seed": SEED,

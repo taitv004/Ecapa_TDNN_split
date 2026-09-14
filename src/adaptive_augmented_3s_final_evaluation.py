@@ -88,7 +88,13 @@ def evaluate(
     rows = read_manifest(TEST_MANIFEST, "final_test")
     trials = read_trials(TEST_TRIALS)
     validation_rows = tuple(
-        ValidationRow(row["relative_audio_path"], row["speaker_id"])
+        ValidationRow(
+            row["sample_id"],
+            row["relative_audio_path"],
+            row["speaker_id"],
+            row["source_dataset"],
+            row["source_recording_id"],
+        )
         for row in rows
     )
     validate_validation_trials(
@@ -124,7 +130,7 @@ def evaluate(
     )
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if checkpoint.get("schema") != "generic_ecapa_aam_training_v2":
+    if checkpoint.get("schema") != "generic_ecapa_aam_training_v3":
         raise ValueError("Checkpoint is not produced by the generic training pipeline")
     frontend = SpeechBrainECAPAFrontend(device="cpu")
     mean_var_norm = frontend.classifier.mods.mean_var_norm
@@ -148,7 +154,7 @@ def evaluate(
             ):
                 value = embedding_model(normalized, lengths).squeeze(1).float()
             value = F.normalize(value, p=2, dim=1).cpu()
-            embeddings.update(zip(batch["relative_audio_path"], value))
+            embeddings.update(zip(batch["sample_id"], value))
             if number % 25 == 0 or number == len(loader):
                 print(f"TEST batch={number}/{len(loader)}", flush=True)
 
@@ -159,12 +165,14 @@ def evaluate(
         try:
             score = float(
                 torch.dot(
-                    embeddings[trial.left_audio_path],
-                    embeddings[trial.right_audio_path],
+                    embeddings[trial.left_sample_id],
+                    embeddings[trial.right_sample_id],
                 )
             )
         except KeyError as error:
-            raise ValueError(f"Test trial path is missing from cache: {error}") from error
+            raise ValueError(
+                f"Test trial sample ID is missing from cache: {error}"
+            ) from error
         scores.append(score)
         targets.append(trial.target)
         score_rows.append(

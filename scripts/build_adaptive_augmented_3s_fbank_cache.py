@@ -25,35 +25,30 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.speechbrain_frontend import SpeechBrainECAPAFrontend
+from src.adaptive_augmented_3s_verification import MANIFEST_FIELDS
+from src.adaptive_augmented_3s_package import (
+    read_common_manifest,
+    validate_training_rows,
+)
 
 
 SPLITS = ("train", "validation")
-MANIFESTS = {
-    "train": ROOT / "manifests/adaptive_augmented_3s_v1_train_manifest.csv",
-    "validation": (
-        ROOT / "manifests/adaptive_augmented_3s_v1_validation_manifest.csv"
-    ),
-}
-LABEL_MAPPING = ROOT / "manifests/adaptive_augmented_3s_v1_speaker_to_label.json"
 CONFIG_FILENAME = "fbank_cache_config_adaptive_augmented_3s_v1.json"
 IDENTITY_FILENAME = "fbank_cache_identity_adaptive_augmented_3s_v1.json"
 INDEX_FILENAMES = {
     "train": "train_feature_index_adaptive_augmented_3s_v1.csv",
     "validation": "validation_feature_index_adaptive_augmented_3s_v1.csv",
 }
-MANIFEST_FIELDS = (
-    "relative_audio_path",
-    "speaker_id",
-    "speaker_label",
-    "final_split",
-)
 INDEX_FIELDS = MANIFEST_FIELDS + ("shard_path", "within_shard_index")
 FEATURE_SHAPE = (301, 80)
 
 
 @dataclass(frozen=True)
 class SourceRow:
+    sample_id: str
     relative_audio_path: str
+    source_dataset: str
+    source_recording_id: str
     speaker_id: str
     speaker_label: int
     final_split: str
@@ -103,55 +98,36 @@ def safe_path(value: str) -> str:
         or pure.is_absolute()
         or ".." in pure.parts
         or "\\" in value
-        or len(pure.parts) != 2
     ):
         raise ValueError(f"Unsafe/nonportable audio path: {value!r}")
     return value
 
 
-def read_manifests() -> tuple[dict[str, list[SourceRow]], dict[str, int]]:
-    try:
-        raw_mapping = json.loads(LABEL_MAPPING.read_text(encoding="utf-8"))
-        labels = {str(key): int(value) for key, value in raw_mapping.items()}
-    except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
-        raise ValueError(f"Invalid speaker label mapping: {LABEL_MAPPING}") from error
-    if not labels or set(labels.values()) != set(range(len(labels))):
-        raise ValueError("Train labels must be contiguous from zero")
-
+def read_manifests(
+    manifest_path: Path, dataset_root: Path
+) -> tuple[dict[str, list[SourceRow]], dict[str, int], dict[str, Any]]:
+    mapped, labels, summary = read_common_manifest(
+        manifest_path,
+        dataset_root=dataset_root,
+        check_audio_exists=False,
+    )
+    validate_training_rows(mapped, labels)
     result: dict[str, list[SourceRow]] = {}
-    speaker_sets: dict[str, set[str]] = {}
-    for split, path in MANIFESTS.items():
-        rows: list[SourceRow] = []
-        seen: set[str] = set()
-        with path.open("r", encoding="utf-8-sig", newline="") as stream:
-            reader = csv.DictReader(stream)
-            if tuple(reader.fieldnames or ()) != MANIFEST_FIELDS:
-                raise ValueError(f"Invalid manifest schema: {path}")
-            for index, raw in enumerate(reader):
-                relative = safe_path(raw["relative_audio_path"].strip())
-                speaker = raw["speaker_id"].strip()
-                label = int(raw["speaker_label"])
-                if (
-                    relative in seen
-                    or PurePosixPath(relative).parent.name != speaker
-                    or raw["final_split"].strip() != split
-                ):
-                    raise ValueError(f"Invalid row {index + 2} in {path}")
-                if split == "train" and labels.get(speaker) != label:
-                    raise ValueError(f"Train label mismatch at {path}:{index + 2}")
-                if split == "validation" and label != -1:
-                    raise ValueError(f"Validation label must be -1 at {path}:{index + 2}")
-                seen.add(relative)
-                rows.append(SourceRow(relative, speaker, label, split, index))
-        if not rows:
-            raise ValueError(f"Manifest is empty: {path}")
-        result[split] = rows
-        speaker_sets[split] = {row.speaker_id for row in rows}
-    if speaker_sets["train"] & speaker_sets["validation"]:
-        raise ValueError("Speaker leakage between train and validation manifests")
-    if set(labels) != speaker_sets["train"]:
-        raise ValueError("Speaker label mapping differs from train speakers")
-    return result, labels
+    for split in SPLITS:
+        result[split] = [
+            SourceRow(
+                str(row["sample_id"]),
+                safe_path(str(row["relative_audio_path"])),
+                str(row["source_dataset"]),
+                str(row["source_recording_id"]),
+                str(row["speaker_id"]),
+                int(row["speaker_label"]),
+                split,
+                index,
+            )
+            for index, row in enumerate(mapped[split])
+        ]
+    return result, labels, summary
 
 
 def render_index(rows: Sequence[SourceRow], split: str, shard_size: int) -> bytes:
@@ -162,7 +138,10 @@ def render_index(rows: Sequence[SourceRow], split: str, shard_size: int) -> byte
         shard, offset = divmod(row.manifest_row_index, shard_size)
         writer.writerow(
             {
+                "sample_id": row.sample_id,
                 "relative_audio_path": row.relative_audio_path,
+                "source_dataset": row.source_dataset,
+                "source_recording_id": row.source_recording_id,
                 "speaker_id": row.speaker_id,
                 "speaker_label": row.speaker_label,
                 "final_split": split,
@@ -189,8 +168,9 @@ def expected_payload(
     selected: Sequence[SourceRow], split: str, features: torch.Tensor
 ) -> dict[str, Any]:
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "features": features.cpu().float().contiguous(),
+        "sample_ids": [row.sample_id for row in selected],
         "speaker_labels": torch.tensor(
             [row.speaker_label for row in selected], dtype=torch.long
         ),
@@ -206,6 +186,7 @@ def validate_shard(
     required = {
         "schema_version",
         "features",
+        "sample_ids",
         "speaker_labels",
         "speaker_ids",
         "relative_audio_paths",
@@ -217,13 +198,14 @@ def validate_shard(
     labels = payload["speaker_labels"]
     count = len(selected)
     if (
-        payload["schema_version"] != 4
+        payload["schema_version"] != 5
         or tuple(features.shape) != (count, *FEATURE_SHAPE)
         or features.dtype != torch.float32
         or features.device.type != "cpu"
         or not bool(torch.isfinite(features).all())
         or labels.dtype != torch.long
         or labels.tolist() != [row.speaker_label for row in selected]
+        or payload["sample_ids"] != [row.sample_id for row in selected]
         or payload["speaker_ids"] != [row.speaker_id for row in selected]
         or payload["relative_audio_paths"]
         != [row.relative_audio_path for row in selected]
@@ -282,6 +264,7 @@ def build_cache(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--dataset-root", required=True, type=Path)
     parser.add_argument("--cache-root", required=True, type=Path)
     parser.add_argument("--device", default="cuda:0")
@@ -292,24 +275,21 @@ def main() -> None:
         raise ValueError("batch-size and shard-size must be positive")
 
     dataset_root = args.dataset_root.expanduser().resolve(strict=True)
+    manifest_path = args.manifest.expanduser().resolve(strict=True)
     cache_root = args.cache_root.expanduser().resolve()
-    rows, labels = read_manifests()
+    rows, labels, manifest_summary = read_manifests(
+        manifest_path, dataset_root
+    )
     bindings = {
-        "train_manifest": {
-            "path": MANIFESTS["train"].relative_to(ROOT).as_posix(),
-            "sha256": sha256_file(MANIFESTS["train"]),
+        "authoritative_manifest": {
+            "sha256": sha256_file(manifest_path),
+            "row_counts": manifest_summary["row_counts"],
+            "speaker_counts": manifest_summary["speaker_counts"],
         },
-        "validation_manifest": {
-            "path": MANIFESTS["validation"].relative_to(ROOT).as_posix(),
-            "sha256": sha256_file(MANIFESTS["validation"]),
-        },
-        "speaker_to_label": {
-            "path": LABEL_MAPPING.relative_to(ROOT).as_posix(),
-            "sha256": sha256_file(LABEL_MAPPING),
-        },
+        "speaker_to_label_sha256": canonical_digest(labels),
     }
     config = {
-        "schema_version": 4,
+        "schema_version": 5,
         "cache_version": "adaptive_augmented_3s_v1_generic",
         "model_source": SpeechBrainECAPAFrontend.SOURCE,
         "speechbrain_version": speechbrain.__version__,
@@ -358,7 +338,7 @@ def main() -> None:
         args.batch_size,
     )
     identity = {
-        "schema_version": 4,
+        "schema_version": 5,
         "identity_kind": "generic_train_validation_fbank_cache",
         "cache_version": config["cache_version"],
         "config_path": CONFIG_FILENAME,
