@@ -432,8 +432,16 @@ def read_frozen_validation_protocol(
         ) from error
     try:
         frame = pd.read_parquet(
-            path,
-            columns=["enroll_sample_id", "test_sample_id", "target"],
+        path,
+        columns=[
+            "enroll_sample_id",
+            "test_sample_id",
+            "label",
+            ],
+        )
+
+        frame = frame.rename(
+            columns={"label": "target"}
         )
     except Exception as error:
         raise ValueError(f"Could not read frozen validation parquet {path}: {error}") from error
