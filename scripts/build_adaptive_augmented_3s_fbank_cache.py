@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""Build a resumable SpeechBrain raw-FBank cache for train/validation."""
+"""Build one split-specific SpeechBrain raw-FBank cache from a frozen handoff manifest."""
 
 from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import io
 import json
 import math
 import os
 import sys
-from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
 
@@ -24,57 +22,34 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.speechbrain_frontend import SpeechBrainECAPAFrontend
-from src.adaptive_augmented_3s_verification import MANIFEST_FIELDS
-from src.adaptive_augmented_3s_package import (
-    read_common_manifest,
-    validate_training_rows,
+from src.frozen_handoff_cache import (
+    CACHE_CONFIG_NAME,
+    CACHE_IDENTITY_NAME,
+    CACHE_INDEX_FIELDS,
+    CACHE_INDEX_NAME,
+    CACHE_SCHEMA_VERSION,
+    CACHE_SHARD_DIR,
+    CACHE_VERSION,
+    FEATURE_SHAPE,
+    ManifestFeatureRow,
+    canonical_digest,
+    read_manifest_split,
+    sha256_file,
 )
-
-
-SPLITS = ("train", "validation")
-CONFIG_FILENAME = "fbank_cache_config_adaptive_augmented_3s_v1.json"
-IDENTITY_FILENAME = "fbank_cache_identity_adaptive_augmented_3s_v1.json"
-INDEX_FILENAMES = {
-    "train": "train_feature_index_adaptive_augmented_3s_v1.csv",
-    "validation": "validation_feature_index_adaptive_augmented_3s_v1.csv",
-}
-INDEX_FIELDS = MANIFEST_FIELDS + ("shard_path", "within_shard_index")
-FEATURE_SHAPE = (301, 80)
-
-
-@dataclass(frozen=True)
-class SourceRow:
-    sample_id: str
-    relative_audio_path: str
-    source_dataset: str
-    source_recording_id: str
-    speaker_id: str
-    speaker_label: int
-    final_split: str
-    manifest_row_index: int
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+from src.speechbrain_frontend import SpeechBrainECAPAFrontend
 
 
 def canonical_json(value: Any) -> bytes:
     return (
-        json.dumps(value, sort_keys=True, ensure_ascii=False, indent=2) + "\n"
-    ).encode("utf-8")
-
-
-def canonical_digest(value: Any) -> str:
-    return hashlib.sha256(
         json.dumps(
-            value, sort_keys=True, ensure_ascii=False, separators=(",", ":")
-        ).encode("utf-8")
-    ).hexdigest()
+            value,
+            sort_keys=True,
+            ensure_ascii=False,
+            indent=2,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
 
 
 def atomic_bytes(path: Path, payload: bytes) -> None:
@@ -91,51 +66,16 @@ def atomic_torch_save(path: Path, payload: Mapping[str, Any]) -> None:
     os.replace(temporary, path)
 
 
-def safe_path(value: str) -> str:
-    pure = PurePosixPath(value)
-    if (
-        not value
-        or pure.is_absolute()
-        or ".." in pure.parts
-        or "\\" in value
-    ):
-        raise ValueError(f"Unsafe/nonportable audio path: {value!r}")
-    return value
-
-
-def read_manifests(
-    manifest_path: Path, dataset_root: Path
-) -> tuple[dict[str, list[SourceRow]], dict[str, int], dict[str, Any]]:
-    mapped, labels, summary = read_common_manifest(
-        manifest_path,
-        dataset_root=dataset_root,
-        check_audio_exists=False,
-    )
-    validate_training_rows(mapped, labels)
-    result: dict[str, list[SourceRow]] = {}
-    for split in SPLITS:
-        result[split] = [
-            SourceRow(
-                str(row["sample_id"]),
-                safe_path(str(row["relative_audio_path"])),
-                str(row["source_dataset"]),
-                str(row["source_recording_id"]),
-                str(row["speaker_id"]),
-                int(row["speaker_label"]),
-                split,
-                index,
-            )
-            for index, row in enumerate(mapped[split])
-        ]
-    return result, labels, summary
-
-
-def render_index(rows: Sequence[SourceRow], split: str, shard_size: int) -> bytes:
+def render_index(rows: Sequence[ManifestFeatureRow], shard_size: int) -> bytes:
     stream = io.StringIO(newline="")
-    writer = csv.DictWriter(stream, fieldnames=INDEX_FIELDS, lineterminator="\n")
+    writer = csv.DictWriter(
+        stream,
+        fieldnames=CACHE_INDEX_FIELDS,
+        lineterminator="\n",
+    )
     writer.writeheader()
-    for row in rows:
-        shard, offset = divmod(row.manifest_row_index, shard_size)
+    for index, row in enumerate(rows):
+        shard, offset = divmod(index, shard_size)
         writer.writerow(
             {
                 "sample_id": row.sample_id,
@@ -144,31 +84,39 @@ def render_index(rows: Sequence[SourceRow], split: str, shard_size: int) -> byte
                 "source_recording_id": row.source_recording_id,
                 "speaker_id": row.speaker_id,
                 "speaker_label": row.speaker_label,
-                "final_split": split,
-                "shard_path": f"{split}/shard_{shard:05d}.pt",
+                "final_split": row.final_split,
+                "shard_path": f"{CACHE_SHARD_DIR}/shard_{shard:05d}.pt",
                 "within_shard_index": offset,
             }
         )
     return stream.getvalue().encode("utf-8")
 
 
-def load_waveform(dataset_root: Path, row: SourceRow) -> torch.Tensor:
-    path = dataset_root.joinpath(*PurePosixPath(row.relative_audio_path).parts)
-    waveform, sample_rate = torchaudio.load(path, normalize=True)
+def load_waveform(dataset_root: Path, row: ManifestFeatureRow) -> torch.Tensor:
+    audio_path = dataset_root.joinpath(
+        *PurePosixPath(row.relative_audio_path).parts
+    )
+    if not audio_path.is_file():
+        raise FileNotFoundError(
+            f"Manifest WAV is missing under dataset root: {audio_path}"
+        )
+    waveform, sample_rate = torchaudio.load(audio_path, normalize=True)
     if (
         sample_rate != 16_000
         or tuple(waveform.shape) != (1, 48_000)
         or not bool(torch.isfinite(waveform).all())
     ):
-        raise ValueError(f"Expected mono 16 kHz/3 s WAV: {path}")
+        raise ValueError(f"Expected mono 16 kHz/3 s WAV: {audio_path}")
     return waveform.squeeze(0)
 
 
 def expected_payload(
-    selected: Sequence[SourceRow], split: str, features: torch.Tensor
+    selected: Sequence[ManifestFeatureRow],
+    split: str,
+    features: torch.Tensor,
 ) -> dict[str, Any]:
     return {
-        "schema_version": 5,
+        "schema_version": CACHE_SCHEMA_VERSION,
         "features": features.cpu().float().contiguous(),
         "sample_ids": [row.sample_id for row in selected],
         "speaker_labels": torch.tensor(
@@ -181,7 +129,9 @@ def expected_payload(
 
 
 def validate_shard(
-    payload: Any, selected: Sequence[SourceRow], split: str
+    payload: Any,
+    selected: Sequence[ManifestFeatureRow],
+    split: str,
 ) -> None:
     required = {
         "schema_version",
@@ -198,7 +148,7 @@ def validate_shard(
     labels = payload["speaker_labels"]
     count = len(selected)
     if (
-        payload["schema_version"] != 5
+        payload["schema_version"] != CACHE_SCHEMA_VERSION
         or tuple(features.shape) != (count, *FEATURE_SHAPE)
         or features.dtype != torch.float32
         or features.device.type != "cpu"
@@ -218,85 +168,122 @@ def build_cache(
     frontend: SpeechBrainECAPAFrontend,
     dataset_root: Path,
     cache_root: Path,
-    rows: Mapping[str, Sequence[SourceRow]],
+    rows: Sequence[ManifestFeatureRow],
+    split: str,
     shard_size: int,
     batch_size: int,
-) -> dict[str, dict[str, int]]:
-    outcome: dict[str, dict[str, int]] = {}
-    for split in SPLITS:
-        written = reused = 0
-        split_rows = rows[split]
-        total = math.ceil(len(split_rows) / shard_size)
-        for shard_number, start in enumerate(range(0, len(split_rows), shard_size)):
-            selected = split_rows[start : start + shard_size]
-            target = cache_root / split / f"shard_{shard_number:05d}.pt"
-            if target.is_file():
-                validate_shard(
-                    torch.load(target, map_location="cpu", weights_only=False),
-                    selected,
-                    split,
-                )
-                reused += 1
-                print(f"{split} shard {shard_number + 1}/{total} reused", flush=True)
-                continue
-            feature_batches: list[torch.Tensor] = []
-            for batch_start in range(0, len(selected), batch_size):
-                batch_rows = selected[batch_start : batch_start + batch_size]
-                waveforms = torch.stack(
-                    [load_waveform(dataset_root, row) for row in batch_rows]
-                )
-                with torch.inference_mode():
-                    features = frontend.compute_features(waveforms)
-                feature_batches.append(features.detach().cpu().float().contiguous())
-                del waveforms, features
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            payload = expected_payload(
-                selected, split, torch.cat(feature_batches, dim=0)
+) -> dict[str, int]:
+    written = reused = 0
+    total = math.ceil(len(rows) / shard_size)
+    for shard_number, start in enumerate(range(0, len(rows), shard_size)):
+        selected = rows[start : start + shard_size]
+        target = cache_root / CACHE_SHARD_DIR / f"shard_{shard_number:05d}.pt"
+        if target.is_file():
+            validate_shard(
+                torch.load(target, map_location="cpu", weights_only=False),
+                selected,
+                split,
             )
-            validate_shard(payload, selected, split)
-            atomic_torch_save(target, payload)
-            written += 1
-            print(f"{split} shard {shard_number + 1}/{total} complete", flush=True)
-        outcome[split] = {"written": written, "reused": reused, "total": total}
-    return outcome
+            reused += 1
+            print(f"{split} shard {shard_number + 1}/{total} reused", flush=True)
+            continue
+
+        feature_batches: list[torch.Tensor] = []
+        for batch_start in range(0, len(selected), batch_size):
+            batch_rows = selected[batch_start : batch_start + batch_size]
+            waveforms = torch.stack(
+                [load_waveform(dataset_root, row) for row in batch_rows]
+            )
+            with torch.inference_mode():
+                features = frontend.compute_features(waveforms)
+            feature_batches.append(features.detach().cpu().float().contiguous())
+            del waveforms, features
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        payload = expected_payload(
+            selected,
+            split,
+            torch.cat(feature_batches, dim=0),
+        )
+        validate_shard(payload, selected, split)
+        atomic_torch_save(target, payload)
+        written += 1
+        print(f"{split} shard {shard_number + 1}/{total} complete", flush=True)
+
+    return {"written": written, "reused": reused, "total": total}
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--split", required=True, choices=("train", "validation"))
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--dataset-root", required=True, type=Path)
     parser.add_argument("--cache-root", required=True, type=Path)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch-size", default=64, type=int)
     parser.add_argument("--shard-size", default=256, type=int)
+    parser.add_argument("--expected-rows", type=int)
+    parser.add_argument("--expected-speakers", type=int)
+
+    # Optional explicit column mapping for train-only manifests.  CommonRawBase
+    # works with auto-detection and normally needs none of these flags.
+    parser.add_argument("--sample-id-column")
+    parser.add_argument("--path-column")
+    parser.add_argument("--speaker-id-column")
+    parser.add_argument("--source-dataset-column")
+    parser.add_argument("--source-recording-id-column")
+    parser.add_argument("--split-column")
     args = parser.parse_args()
+
     if args.batch_size < 1 or args.shard_size < 1:
         raise ValueError("batch-size and shard-size must be positive")
+    if args.expected_rows is not None and args.expected_rows < 1:
+        raise ValueError("expected-rows must be positive")
+    if args.expected_speakers is not None and args.expected_speakers < 1:
+        raise ValueError("expected-speakers must be positive")
 
     dataset_root = args.dataset_root.expanduser().resolve(strict=True)
     manifest_path = args.manifest.expanduser().resolve(strict=True)
     cache_root = args.cache_root.expanduser().resolve()
-    rows, labels, manifest_summary = read_manifests(
-        manifest_path, dataset_root
+
+    rows, labels, summary = read_manifest_split(
+        manifest_path,
+        args.split,
+        sample_id_column=args.sample_id_column,
+        path_column=args.path_column,
+        speaker_id_column=args.speaker_id_column,
+        source_dataset_column=args.source_dataset_column,
+        source_recording_id_column=args.source_recording_id_column,
+        split_column=args.split_column,
     )
-    bindings = {
-        "authoritative_manifest": {
-            "sha256": sha256_file(manifest_path),
-            "row_counts": manifest_summary["row_counts"],
-            "speaker_counts": manifest_summary["speaker_counts"],
-        },
-        "speaker_to_label_sha256": canonical_digest(labels),
-    }
+    if args.expected_rows is not None and len(rows) != args.expected_rows:
+        raise ValueError(
+            f"Expected {args.expected_rows} {args.split} rows, found {len(rows)}"
+        )
+    speaker_count = len({row.speaker_id for row in rows})
+    if args.expected_speakers is not None and speaker_count != args.expected_speakers:
+        raise ValueError(
+            f"Expected {args.expected_speakers} {args.split} speakers, "
+            f"found {speaker_count}"
+        )
+
+    cache_root.mkdir(parents=True, exist_ok=True)
+    index_payload = render_index(rows, args.shard_size)
+    index_path = cache_root / CACHE_INDEX_NAME
+
+    label_mapping_sha = canonical_digest(labels) if args.split == "train" else None
     config = {
-        "schema_version": 5,
-        "cache_version": "adaptive_augmented_3s_v1_generic",
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "cache_version": CACHE_VERSION,
+        "split": args.split,
         "model_source": SpeechBrainECAPAFrontend.SOURCE,
         "speechbrain_version": speechbrain.__version__,
         "torch_version": torch.__version__,
         "torchaudio_version": torchaudio.__version__,
-        "input_bindings": bindings,
-        "included_splits": list(SPLITS),
+        "manifest_sha256": sha256_file(manifest_path),
+        "manifest_columns": summary,
+        "speaker_to_label_sha256": label_mapping_sha,
         "feature_stage": "raw_compute_features_before_mean_var_norm",
         "feature_shape": list(FEATURE_SHAPE),
         "feature_dtype": "float32",
@@ -304,28 +291,25 @@ def main() -> None:
         "transposed": False,
         "shard_size": args.shard_size,
         "extraction_batch_size": args.batch_size,
-        "expected_rows": {split: len(rows[split]) for split in SPLITS},
-        "train_class_count": len(labels),
-        "train_label_range": [0, len(labels) - 1],
+        "row_count": len(rows),
+        "speaker_count": speaker_count,
+        "train_class_count": len(labels) if args.split == "train" else None,
         "validation_label": -1,
-        "index_filenames": INDEX_FILENAMES,
-        "index_fields": list(INDEX_FIELDS),
+        "index_filename": CACHE_INDEX_NAME,
+        "index_fields": list(CACHE_INDEX_FIELDS),
+        "shard_dir": CACHE_SHARD_DIR,
     }
     config_payload = canonical_json(config)
-    cache_root.mkdir(parents=True, exist_ok=True)
-    config_path = cache_root / CONFIG_FILENAME
+    config_path = cache_root / CACHE_CONFIG_NAME
     if config_path.exists() and config_path.read_bytes() != config_payload:
         raise ValueError(
-            "Existing cache was built for different manifests/settings; "
+            "Existing cache was built for another manifest/split/settings; "
             "use an empty cache directory"
         )
+    if index_path.exists() and index_path.read_bytes() != index_payload:
+        raise ValueError("Existing feature index conflicts with current manifest")
     atomic_bytes(config_path, config_payload)
-    for split in SPLITS:
-        index_payload = render_index(rows[split], split, args.shard_size)
-        index_path = cache_root / INDEX_FILENAMES[split]
-        if index_path.exists() and index_path.read_bytes() != index_payload:
-            raise ValueError(f"Existing {split} index conflicts with current manifest")
-        atomic_bytes(index_path, index_payload)
+    atomic_bytes(index_path, index_payload)
 
     frontend = SpeechBrainECAPAFrontend(device=args.device)
     frontend.eval()
@@ -334,36 +318,38 @@ def main() -> None:
         dataset_root,
         cache_root,
         rows,
+        args.split,
         args.shard_size,
         args.batch_size,
     )
+
     identity = {
-        "schema_version": 5,
-        "identity_kind": "generic_train_validation_fbank_cache",
-        "cache_version": config["cache_version"],
-        "config_path": CONFIG_FILENAME,
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "identity_kind": "frozen_handoff_split_fbank_cache",
+        "cache_version": CACHE_VERSION,
+        "split": args.split,
         "config_sha256": sha256_file(config_path),
-        "input_bindings": bindings,
-        "included_splits": list(SPLITS),
-        "row_counts": config["expected_rows"],
-        "train_class_count": len(labels),
+        "index_sha256": sha256_file(index_path),
+        "manifest_sha256": sha256_file(manifest_path),
+        "row_count": len(rows),
+        "speaker_count": speaker_count,
+        "train_class_count": len(labels) if args.split == "train" else None,
         "feature_shape": list(FEATURE_SHAPE),
         "shard_size": args.shard_size,
-        "index_sha256": {
-            split: sha256_file(cache_root / INDEX_FILENAMES[split])
-            for split in SPLITS
-        },
-        "final_test_cache_absent": True,
+        "shard_count": outcome["total"],
     }
     identity["identity_sha256"] = canonical_digest(identity)
-    atomic_bytes(cache_root / IDENTITY_FILENAME, canonical_json(identity))
+    atomic_bytes(cache_root / CACHE_IDENTITY_NAME, canonical_json(identity))
+
     print(
         json.dumps(
             {
                 "result": "PASS",
+                "split": args.split,
                 "cache_identity": identity["identity_sha256"],
-                "rows": identity["row_counts"],
-                "train_classes": len(labels),
+                "rows": len(rows),
+                "speakers": speaker_count,
+                "train_classes": len(labels) if args.split == "train" else None,
                 "shards": outcome,
             },
             indent=2,

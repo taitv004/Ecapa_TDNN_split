@@ -1,4 +1,4 @@
-"""Generic ECAPA/AAM fine-tuning with cached SpeechBrain Fbanks."""
+"""ECAPA/AAM fine-tuning from split-specific frozen-handoff FBank caches."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import math
 import os
 import random
 from collections import Counter, OrderedDict, defaultdict
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterator, Mapping, Sequence
 
 import numpy as np
@@ -26,35 +26,98 @@ from src.aam_training import (
 from src.adaptive_augmented_3s_verification import (
     MANIFEST_FIELDS,
     TRIAL_FIELDS,
-    ValidationRow,
     ValidationTrial,
-    sha256_file,
-    validate_validation_trials,
 )
-from src.adaptive_augmented_3s_package import (
-    read_common_manifest,
-    validate_training_rows,
+from src.frozen_handoff_cache import (
+    CACHE_SCHEMA_VERSION,
+    FEATURE_SHAPE,
+    CacheArtifact,
+    CacheFeatureRow,
+    FrozenValidationProtocol,
+    canonical_digest,
+    read_cache_artifact,
+    read_frozen_validation_protocol,
 )
 from src.speechbrain_frontend import SpeechBrainECAPAFrontend
 from src.verification_metrics import calculate_eer
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CACHE_ROOT = ROOT / "outputs/fbank_cache_adaptive_augmented_3s_v1"
 DEFAULT_CONFIG = ROOT / "configs/adaptive_augmented_3s_training_v1.json"
-DEFAULT_OUTPUT = ROOT / "outputs/ecapa_aam_adaptive_augmented_3s_v1"
-CACHE_CONFIG_NAME = "fbank_cache_config_adaptive_augmented_3s_v1.json"
-CACHE_IDENTITY_NAME = "fbank_cache_identity_adaptive_augmented_3s_v1.json"
-FEATURE_SHAPE = (301, 80)
+DEFAULT_OUTPUT = ROOT / "outputs/ecapa_aam_frozen_handoff_v1"
 EMBEDDING_DIM = 192
 
+# Backward-compatible names used only by historical evaluation scripts.
+CACHE_CONFIG_NAME = "fbank_cache_config_adaptive_augmented_3s_v1.json"
+CACHE_IDENTITY_NAME = "fbank_cache_identity_adaptive_augmented_3s_v1.json"
 
-def canonical_digest(value: Any) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            value, sort_keys=True, ensure_ascii=False, separators=(",", ":")
-        ).encode("utf-8")
-    ).hexdigest()
+
+def read_manifest(path: Path, split: str) -> list[dict[str, Any]]:
+    """Read the legacy portable manifest used by historical evaluation code."""
+    rows: list[dict[str, Any]] = []
+    seen_samples: set[str] = set()
+    seen_paths: set[str] = set()
+    with path.open("r", encoding="utf-8-sig", newline="") as stream:
+        reader = csv.DictReader(stream)
+        if tuple(reader.fieldnames or ()) != MANIFEST_FIELDS:
+            raise ValueError(f"Invalid manifest schema: {path}")
+        for line, raw in enumerate(reader, start=2):
+            relative = raw["relative_audio_path"].strip()
+            sample_id = raw["sample_id"].strip()
+            speaker = raw["speaker_id"].strip()
+            label = int(raw["speaker_label"])
+            if (
+                not relative
+                or not sample_id
+                or relative in seen_paths
+                or sample_id in seen_samples
+                or not speaker
+                or raw["final_split"].strip() != split
+            ):
+                raise ValueError(f"Invalid manifest row at {path}:{line}")
+            if split == "train" and label < 0:
+                raise ValueError(f"Negative train label at {path}:{line}")
+            if split != "train" and label != -1:
+                raise ValueError(f"Evaluation label must be -1 at {path}:{line}")
+            seen_paths.add(relative)
+            seen_samples.add(sample_id)
+            rows.append(
+                {
+                    "sample_id": sample_id,
+                    "relative_audio_path": relative,
+                    "source_dataset": raw["source_dataset"].strip(),
+                    "source_recording_id": raw["source_recording_id"].strip(),
+                    "speaker_id": speaker,
+                    "speaker_label": label,
+                    "final_split": split,
+                }
+            )
+    if not rows:
+        raise ValueError(f"Manifest is empty: {path}")
+    return rows
+
+
+def read_trials(path: Path) -> tuple[ValidationTrial, ...]:
+    """Read the legacy CSV trial format used only by historical evaluators."""
+    trials: list[ValidationTrial] = []
+    with path.open("r", encoding="utf-8-sig", newline="") as stream:
+        reader = csv.DictReader(stream)
+        if tuple(reader.fieldnames or ()) != TRIAL_FIELDS:
+            raise ValueError(f"Invalid trial schema: {path}")
+        for raw in reader:
+            trials.append(
+                ValidationTrial(
+                    raw["trial_id"],
+                    raw["left_sample_id"],
+                    raw["right_sample_id"],
+                    raw["left_speaker_id"],
+                    raw["right_speaker_id"],
+                    int(raw["target"]),
+                )
+            )
+    if not trials:
+        raise ValueError("Validation trials are empty")
+    return tuple(trials)
 
 
 def to_cpu(value: Any) -> Any:
@@ -76,108 +139,114 @@ def atomic_save(path: Path, value: Mapping[str, Any]) -> None:
     os.replace(temporary, path)
 
 
-def read_manifest(path: Path, split: str) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    seen_samples: set[str] = set()
-    seen_paths: set[str] = set()
-    with path.open("r", encoding="utf-8-sig", newline="") as stream:
-        reader = csv.DictReader(stream)
-        if tuple(reader.fieldnames or ()) != MANIFEST_FIELDS:
-            raise ValueError(f"Invalid manifest schema: {path}")
-        for line, raw in enumerate(reader, start=2):
-            relative = raw["relative_audio_path"].strip()
-            sample_id = raw["sample_id"].strip()
-            source_dataset = raw["source_dataset"].strip()
-            source_recording_id = raw["source_recording_id"].strip()
-            speaker = raw["speaker_id"].strip()
-            label = int(raw["speaker_label"])
-            if (
-                not relative
-                or not sample_id
-                or not source_dataset
-                or not source_recording_id
-                or relative in seen_paths
-                or sample_id in seen_samples
-                or not speaker
-                or raw["final_split"].strip() != split
-            ):
-                raise ValueError(f"Invalid manifest row at {path}:{line}")
-            if split == "train" and label < 0:
-                raise ValueError(f"Negative train label at {path}:{line}")
-            if split in {"validation", "final_test"} and label != -1:
-                raise ValueError(f"Evaluation label must be -1 at {path}:{line}")
-            seen_paths.add(relative)
-            seen_samples.add(sample_id)
-            rows.append(
-                {
-                    "sample_id": sample_id,
-                    "relative_audio_path": relative,
-                    "source_dataset": source_dataset,
-                    "source_recording_id": source_recording_id,
-                    "speaker_id": speaker,
-                    "speaker_label": label,
-                    "final_split": split,
-                }
-            )
-    if not rows:
-        raise ValueError(f"Manifest is empty: {path}")
-    return rows
-
-
-def read_trials(path: Path) -> tuple[ValidationTrial, ...]:
-    trials: list[ValidationTrial] = []
-    with path.open("r", encoding="utf-8-sig", newline="") as stream:
-        reader = csv.DictReader(stream)
-        if tuple(reader.fieldnames or ()) != TRIAL_FIELDS:
-            raise ValueError(f"Invalid trial schema: {path}")
-        for raw in reader:
-            trials.append(
-                ValidationTrial(
-                    raw["trial_id"],
-                    raw["left_sample_id"],
-                    raw["right_sample_id"],
-                    raw["left_speaker_id"],
-                    raw["right_speaker_id"],
-                    int(raw["target"]),
-                )
-            )
-    if not trials:
-        raise ValueError("Validation trials are empty")
-    positives = sum(trial.target == 1 for trial in trials)
-    negatives = sum(trial.target == 0 for trial in trials)
-    if positives < 1 or negatives < 1:
-        raise ValueError("Validation trials need genuine and impostor pairs")
-    return tuple(trials)
-
-
 class CachedDataset(Dataset[dict[str, Any]]):
+    """Read either the new split cache or a legacy manifest-aligned cache.
+
+    Primary frozen-handoff training constructs this class with a ``CacheArtifact``
+    and therefore needs no source manifest at runtime.  The positional legacy
+    form is retained only so the repository's historical evaluation utilities
+    continue to work with their old combined-cache layout.
+    """
+
     def __init__(
         self,
-        rows: Sequence[Mapping[str, Any]],
-        cache_root: Path,
-        split: str,
-        shard_size: int,
-        max_cached_shards: int,
+        artifact_or_rows: CacheArtifact | Sequence[Mapping[str, Any]],
+        cache_root: Path | None = None,
+        split: str | None = None,
+        shard_size: int | None = None,
+        max_cached_shards: int = 2,
     ) -> None:
-        self.rows = list(rows)
-        self.cache_root = cache_root
-        self.split = split
-        self.shard_size = shard_size
-        self.max_cached_shards = max_cached_shards
-        self._cache: OrderedDict[int, Mapping[str, Any]] = OrderedDict()
+        if max_cached_shards < 1:
+            raise ValueError("max_cached_shards must be positive")
+        self.max_cached_shards = int(max_cached_shards)
+        self._cache: OrderedDict[Any, Mapping[str, Any]] = OrderedDict()
+
+        if isinstance(artifact_or_rows, CacheArtifact):
+            if cache_root is not None or split is not None or shard_size is not None:
+                raise TypeError(
+                    "New split-cache mode accepts only CacheArtifact and "
+                    "max_cached_shards"
+                )
+            self.mode = "split_cache"
+            self.artifact: CacheArtifact | None = artifact_or_rows
+            self.rows = list(artifact_or_rows.rows)
+            self.cache_root = artifact_or_rows.root
+            self.split = str(artifact_or_rows.config["split"])
+            self.shard_size = int(artifact_or_rows.config["shard_size"])
+            return
+
+        if cache_root is None or split is None or shard_size is None:
+            raise TypeError(
+                "Legacy cache mode requires rows, cache_root, split and shard_size"
+            )
+        if int(shard_size) < 1:
+            raise ValueError("shard_size must be positive")
+        self.mode = "legacy_manifest_aligned"
+        self.artifact = None
+        self.rows = list(artifact_or_rows)
+        self.cache_root = Path(cache_root)
+        self.split = str(split)
+        self.shard_size = int(shard_size)
 
     def __len__(self) -> int:
         return len(self.rows)
 
     def shard_path_for_index(self, index: int) -> str:
+        if self.mode == "split_cache":
+            return self.rows[index].shard_path
         return f"{self.split}/shard_{index // self.shard_size:05d}.pt"
 
-    def _load_shard(self, shard_number: int) -> Mapping[str, Any]:
+    @property
+    def shard_count(self) -> int:
+        if self.mode == "split_cache":
+            return len({row.shard_path for row in self.rows})
+        return math.ceil(len(self.rows) / self.shard_size)
+
+    def _load_split_shard(self, relative_path: str) -> Mapping[str, Any]:
+        if relative_path in self._cache:
+            value = self._cache.pop(relative_path)
+            self._cache[relative_path] = value
+            return value
+        pure = PurePosixPath(relative_path)
+        path = self.cache_root.joinpath(*pure.parts)
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing FBank shard: {path}")
+        value = torch.load(path, map_location="cpu", weights_only=False)
+        required = {
+            "schema_version",
+            "features",
+            "sample_ids",
+            "speaker_labels",
+            "speaker_ids",
+            "relative_audio_paths",
+            "final_split",
+        }
+        if not isinstance(value, Mapping) or set(value) != required:
+            raise ValueError(f"Malformed FBank shard: {path}")
+        if value["schema_version"] != CACHE_SCHEMA_VERSION:
+            raise ValueError(f"Unsupported FBank shard schema: {path}")
+        features = value["features"]
+        if (
+            not isinstance(features, torch.Tensor)
+            or features.ndim != 3
+            or tuple(features.shape[1:]) != FEATURE_SHAPE
+            or features.dtype != torch.float32
+            or value["final_split"] != self.split
+        ):
+            raise ValueError(f"FBank shard contract mismatch: {path}")
+        self._cache[relative_path] = value
+        while len(self._cache) > self.max_cached_shards:
+            self._cache.popitem(last=False)
+        return value
+
+    def _load_legacy_shard(self, shard_number: int) -> Mapping[str, Any]:
         if shard_number in self._cache:
             value = self._cache.pop(shard_number)
             self._cache[shard_number] = value
             return value
         path = self.cache_root / self.split / f"shard_{shard_number:05d}.pt"
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing legacy FBank shard: {path}")
         value = torch.load(path, map_location="cpu", weights_only=False)
         self._cache[shard_number] = value
         while len(self._cache) > self.max_cached_shards:
@@ -185,22 +254,62 @@ class CachedDataset(Dataset[dict[str, Any]]):
         return value
 
     def __getitem__(self, index: int) -> dict[str, Any]:
+        if self.mode == "split_cache":
+            row = self.rows[index]
+            shard = self._load_split_shard(row.shard_path)
+            offset = row.within_shard_index
+            try:
+                sample_id = shard["sample_ids"][offset]
+                relative_path = shard["relative_audio_paths"][offset]
+                speaker_id = shard["speaker_ids"][offset]
+                label = int(shard["speaker_labels"][offset])
+                feature = shard["features"][offset]
+            except (IndexError, TypeError) as error:
+                raise ValueError(
+                    f"Cache index points outside shard: {row.shard_path}:{offset}"
+                ) from error
+            if (
+                sample_id != row.sample_id
+                or relative_path != row.relative_audio_path
+                or speaker_id != row.speaker_id
+                or label != row.speaker_label
+            ):
+                raise ValueError("Cache feature index and shard identity disagree")
+            if tuple(feature.shape) != FEATURE_SHAPE or feature.dtype != torch.float32:
+                raise ValueError("Invalid cached FBank tensor")
+            return {
+                "fbank": feature,
+                "sample_id": row.sample_id,
+                "speaker_label": row.speaker_label,
+                "speaker_id": row.speaker_id,
+                "relative_audio_path": row.relative_audio_path,
+                "dataset_index": index,
+                "final_split": self.split,
+            }
+
         row = self.rows[index]
         shard_number, offset = divmod(index, self.shard_size)
-        shard = self._load_shard(shard_number)
+        shard = self._load_legacy_shard(shard_number)
+        try:
+            sample_id = shard["sample_ids"][offset]
+            relative_path = shard["relative_audio_paths"][offset]
+            feature = shard["features"][offset]
+            label = int(shard["speaker_labels"][offset])
+        except (KeyError, IndexError, TypeError) as error:
+            raise ValueError(
+                f"Malformed legacy FBank shard {self.split}/{shard_number:05d}"
+            ) from error
         if (
-            shard["sample_ids"][offset] != row["sample_id"]
-            or shard["relative_audio_paths"][offset]
-            != row["relative_audio_path"]
+            sample_id != row["sample_id"]
+            or relative_path != row["relative_audio_path"]
         ):
             raise ValueError("Cache and manifest row order disagree")
-        feature = shard["features"][offset]
         if tuple(feature.shape) != FEATURE_SHAPE or feature.dtype != torch.float32:
             raise ValueError("Invalid cached FBank tensor")
         return {
             "fbank": feature,
             "sample_id": row["sample_id"],
-            "speaker_label": int(shard["speaker_labels"][offset]),
+            "speaker_label": label,
             "speaker_id": row["speaker_id"],
             "relative_audio_path": row["relative_audio_path"],
             "dataset_index": index,
@@ -250,7 +359,7 @@ class ShardAwarePKSampler(Sampler[list[int]]):
         grouped: dict[str, list[int]] = defaultdict(list)
         shards: dict[str, list[int]] = defaultdict(list)
         for index, row in enumerate(dataset.rows):
-            grouped[row["speaker_id"]].append(index)
+            grouped[row.speaker_id].append(index)
             shards[dataset.shard_path_for_index(index)].append(index)
         if len(grouped) < self.p:
             raise ValueError(f"P={self.p} exceeds {len(grouped)} train speakers")
@@ -294,7 +403,7 @@ class ShardAwarePKSampler(Sampler[list[int]]):
                 preferred: dict[str, set[int]] = defaultdict(set)
                 for shard in active:
                     for index in self.shard_indexes[shard]:
-                        preferred[self.dataset.rows[index]["speaker_id"]].add(index)
+                        preferred[self.dataset.rows[index].speaker_id].add(index)
                 if len(preferred) >= self.p or width == len(shard_order):
                     break
                 width = min(len(shard_order), width + self.active_window)
@@ -359,12 +468,9 @@ def cosine_factor(step: int, total_steps: int, minimum: float) -> float:
 
 def load_configuration(
     config_path: Path,
-    cache_root: Path,
-    manifest_path: Path,
-    trials_path: Path,
-    train_rows: Sequence[Mapping[str, Any]],
-    validation_rows: Sequence[Mapping[str, Any]],
-    trial_count: int,
+    train_cache: CacheArtifact,
+    validation_cache: CacheArtifact,
+    trials: FrozenValidationProtocol,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     config = json.loads(config_path.read_text(encoding="utf-8"))
     if config.get("schema_version") != 2:
@@ -374,9 +480,10 @@ def load_configuration(
         "embedding_dim": 192,
     }:
         raise ValueError("Training config must use the SpeechBrain ECAPA-192 model")
-    if config.get("aam", {}).get("margin") != 0.2 or config.get("aam", {}).get(
-        "scale"
-    ) != 30.0:
+    if (
+        config.get("aam", {}).get("margin") != 0.2
+        or config.get("aam", {}).get("scale") != 30.0
+    ):
         raise ValueError("Training config must use AAM margin=0.2 and scale=30")
     if config.get("optimizer", {}).get("name") != "AdamW":
         raise ValueError("Training config optimizer must be AdamW")
@@ -386,6 +493,7 @@ def load_configuration(
         raise ValueError("This training implementation expects warmup_steps=0")
     if config.get("amp", {}).get("ecapa_dtype") != "float16":
         raise ValueError("ECAPA AMP dtype must be float16")
+
     numeric_positive = (
         config["optimizer"]["ecapa_lr"],
         config["optimizer"]["aam_lr"],
@@ -395,7 +503,9 @@ def load_configuration(
         config["log_every_updates"],
     )
     if any(float(value) <= 0.0 for value in numeric_positive):
-        raise ValueError("Learning rates, decay, patience and intervals must be positive")
+        raise ValueError(
+            "Learning rates, decay, patience and intervals must be positive"
+        )
     sampler = config["sampler"]
     if sampler.get("name") != "HybridShardAwareSpeakerBatchSampler":
         raise ValueError("Training config sampler is invalid")
@@ -406,10 +516,17 @@ def load_configuration(
     microbatch = int(config["microbatch_size"])
     if logical_batch % microbatch or int(sampler["speakers_per_batch"]) % microbatch:
         raise ValueError("Logical batch must be divisible by microbatch_size")
-    classes = len({row["speaker_id"] for row in train_rows})
-    labels = {int(row["speaker_label"]) for row in train_rows}
+
+    train_rows = train_cache.rows
+    classes = len({row.speaker_id for row in train_rows})
+    labels = {row.speaker_label for row in train_rows}
     if labels != set(range(classes)):
-        raise ValueError("Train labels must be contiguous and match train speakers")
+        raise ValueError("Train cache labels must be contiguous and match speakers")
+    if int(train_cache.config["train_class_count"]) != classes:
+        raise ValueError("Train cache class count mismatch")
+    if validation_cache.config.get("train_class_count") is not None:
+        raise ValueError("Validation cache must not contain train classes")
+
     steps = sampler.get("batches_per_epoch", "auto")
     if steps == "auto":
         steps = math.ceil(len(train_rows) / logical_batch)
@@ -418,46 +535,24 @@ def load_configuration(
     if steps < 1 or epochs < 1:
         raise ValueError("Training steps and epochs must be positive")
 
-    cache_config_path = cache_root / CACHE_CONFIG_NAME
-    cache_identity_path = cache_root / CACHE_IDENTITY_NAME
-    cache_config = json.loads(cache_config_path.read_text(encoding="utf-8"))
-    cache_identity = json.loads(cache_identity_path.read_text(encoding="utf-8"))
-    cached_bindings = cache_config.get("input_bindings", {})
-    label_mapping = {
-        str(row["speaker_id"]): int(row["speaker_label"])
-        for row in train_rows
-    }
-    if (
-        cache_config.get("expected_rows")
-        != {"train": len(train_rows), "validation": len(validation_rows)}
-        or cache_config.get("train_class_count") != classes
-        or cache_config.get("feature_shape") != list(FEATURE_SHAPE)
-        or cache_identity.get("config_sha256") != sha256_file(cache_config_path)
-        or cached_bindings.get("authoritative_manifest", {}).get("sha256")
-        != sha256_file(manifest_path)
-        or cached_bindings.get("speaker_to_label_sha256")
-        != canonical_digest(label_mapping)
-        or cache_identity.get("input_bindings") != cached_bindings
-    ):
-        raise ValueError("Cache identity/counts disagree with current manifests")
     runtime = json.loads(json.dumps(config))
     runtime["aam"]["num_classes"] = classes
     runtime["sampler"]["batches_per_epoch"] = steps
     runtime["scheduler"]["steps_per_epoch"] = steps
     runtime["scheduler"]["total_steps"] = steps * epochs
-    runtime["validation"]["trial_count"] = trial_count
+    runtime["validation"]["trial_count"] = len(trials)
     runtime["cache"] = {
-        "identity_sha256": cache_identity["identity_sha256"],
-        "config_sha256": cache_identity["config_sha256"],
-        "train_rows": len(train_rows),
-        "validation_rows": len(validation_rows),
+        "train_identity_sha256": train_cache.identity["identity_sha256"],
+        "validation_identity_sha256": validation_cache.identity["identity_sha256"],
+        "train_rows": len(train_cache.rows),
+        "validation_rows": len(validation_cache.rows),
         "feature_shape": list(FEATURE_SHAPE),
     }
     binding = {
         "configuration_sha256": canonical_digest(runtime),
-        "cache_identity_sha256": cache_identity["identity_sha256"],
-        "authoritative_manifest_sha256": sha256_file(manifest_path),
-        "validation_trials_sha256": sha256_file(trials_path),
+        "train_cache_identity_sha256": train_cache.identity["identity_sha256"],
+        "validation_cache_identity_sha256": validation_cache.identity["identity_sha256"],
+        "validation_trials_sha256": trials.sha256,
     }
     return runtime, binding
 
@@ -504,18 +599,22 @@ def build_models(
 
 def evaluate_validation(
     dataset: CachedDataset,
-    trials: Sequence[ValidationTrial],
+    trials: FrozenValidationProtocol,
     mean_var_norm: torch.nn.Module,
     embedding_model: torch.nn.Module,
     device: torch.device,
     batch_size: int,
 ) -> dict[str, float]:
     loader = DataLoader(
-        dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=collate
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate,
     )
     mean_var_norm.eval()
     embedding_model.eval()
-    embeddings: dict[str, torch.Tensor] = {}
+    embeddings = torch.empty((len(dataset), EMBEDDING_DIM), dtype=torch.float32)
     with torch.inference_mode():
         for batch_number, batch in enumerate(loader, start=1):
             features = batch["fbank"].to(device=device, dtype=torch.float32)
@@ -526,25 +625,22 @@ def evaluate_validation(
             ):
                 value = embedding_model(normalized, lengths).squeeze(1).float()
             value = F.normalize(value, p=2, dim=1).cpu()
-            embeddings.update(zip(batch["sample_id"], value))
+            embeddings[batch["dataset_index"]] = value
             if batch_number % 25 == 0 or batch_number == len(loader):
                 print(
-                    f"VALIDATION batch={batch_number}/{len(loader)}", flush=True
+                    f"VALIDATION batch={batch_number}/{len(loader)}",
+                    flush=True,
                 )
+
     scores: list[float] = []
-    targets: list[int] = []
-    for trial in trials:
-        try:
-            score = torch.dot(
-                embeddings[trial.left_sample_id],
-                embeddings[trial.right_sample_id],
-            )
-        except KeyError as error:
-            raise ValueError(
-                f"Trial sample ID missing from validation cache: {error}"
-            ) from error
-        scores.append(float(score))
-        targets.append(trial.target)
+    chunk_size = 100_000
+    for start in range(0, len(trials), chunk_size):
+        stop = min(start + chunk_size, len(trials))
+        enroll = torch.from_numpy(trials.enroll_indices[start:stop].astype(np.int64))
+        test = torch.from_numpy(trials.test_indices[start:stop].astype(np.int64))
+        chunk_scores = (embeddings[enroll] * embeddings[test]).sum(dim=1)
+        scores.extend(chunk_scores.tolist())
+    targets = trials.targets.astype(np.int64).tolist()
     result = calculate_eer(scores, targets)
     apply_batchnorm_policy(embedding_model)
     return {
@@ -556,9 +652,9 @@ def evaluate_validation(
 def run_training(
     *,
     config_path: Path,
-    manifest_path: Path,
+    train_cache_root: Path,
+    validation_cache_root: Path,
     trials_path: Path,
-    cache_root: Path,
     output_dir: Path,
     device_name: str,
     resume: Path | None,
@@ -567,54 +663,33 @@ def run_training(
     if device_name.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
     device = torch.device(device_name)
-    mapped_rows, labels, manifest_summary = read_common_manifest(manifest_path)
-    validate_training_rows(mapped_rows, labels)
-    train_rows = mapped_rows["train"]
-    validation_rows = mapped_rows["validation"]
-    trials = read_trials(trials_path)
-    trial_rows = tuple(
-        ValidationRow(
-            row["sample_id"],
-            row["relative_audio_path"],
-            row["speaker_id"],
-            row["source_dataset"],
-            row["source_recording_id"],
-        )
-        for row in validation_rows
-    )
-    validate_validation_trials(
-        trials,
-        trial_rows,
-        genuine_count=sum(trial.target == 1 for trial in trials),
-        impostor_count=sum(trial.target == 0 for trial in trials),
+
+    train_cache = read_cache_artifact(train_cache_root, "train")
+    validation_cache = read_cache_artifact(validation_cache_root, "validation")
+    trials = read_frozen_validation_protocol(
+        trials_path,
+        validation_cache.rows,
+        enforce_primary_frozen_identity=True,
     )
     config, binding = load_configuration(
         config_path,
-        cache_root,
-        manifest_path,
-        trials_path,
-        train_rows,
-        validation_rows,
-        len(trials),
+        train_cache,
+        validation_cache,
+        trials,
     )
     print(
-        "MANIFEST "
-        f"train_speakers={manifest_summary['speaker_counts']['train']} "
-        f"validation_speakers={manifest_summary['speaker_counts']['validation']} "
-        f"train_rows={len(train_rows)} validation_rows={len(validation_rows)}",
+        "CACHE "
+        f"train_speakers={train_cache.config['speaker_count']} "
+        f"validation_speakers={validation_cache.config['speaker_count']} "
+        f"train_rows={len(train_cache.rows)} "
+        f"validation_rows={len(validation_cache.rows)} "
+        f"trials={len(trials)}",
         flush=True,
     )
-    cache_config = json.loads(
-        (cache_root / CACHE_CONFIG_NAME).read_text(encoding="utf-8")
-    )
-    shard_size = int(cache_config["shard_size"])
+
     max_shards = max(1, int(config["sampler"]["active_shard_window"]))
-    train_dataset = CachedDataset(
-        train_rows, cache_root, "train", shard_size, max_shards
-    )
-    validation_dataset = CachedDataset(
-        validation_rows, cache_root, "validation", shard_size, 2
-    )
+    train_dataset = CachedDataset(train_cache, max_cached_shards=max_shards)
+    validation_dataset = CachedDataset(validation_cache, max_cached_shards=2)
 
     seed = int(config["sampler"]["seed"])
     random.seed(seed)
@@ -635,7 +710,7 @@ def run_training(
 
     def checkpoint_payload(reason: str) -> dict[str, Any]:
         return {
-            "schema": "generic_ecapa_aam_training_v3",
+            "schema": "frozen_handoff_ecapa_aam_training_v1",
             "reason": reason,
             "binding": binding,
             "runtime_config": config,
@@ -658,7 +733,7 @@ def run_training(
     if resume is not None:
         checkpoint = torch.load(resume, map_location="cpu", weights_only=False)
         if (
-            checkpoint.get("schema") != "generic_ecapa_aam_training_v3"
+            checkpoint.get("schema") != "frozen_handoff_ecapa_aam_training_v1"
             or checkpoint.get("binding") != binding
             or checkpoint.get("runtime_config") != config
         ):
@@ -698,6 +773,7 @@ def run_training(
     microbatch_size = int(config["microbatch_size"])
     batches_per_epoch = int(sampler_config["batches_per_epoch"])
     updates_this_call = 0
+
     for epoch in range(state["next_epoch"], config["scheduler"]["max_epochs"]):
         sampler = ShardAwarePKSampler(
             train_dataset,
@@ -705,7 +781,7 @@ def run_training(
             samples_per_speaker=sampler_config["samples_per_speaker"],
             active_shard_window=min(
                 sampler_config["active_shard_window"],
-                math.ceil(len(train_dataset) / shard_size),
+                train_dataset.shard_count,
             ),
             batches_per_epoch=batches_per_epoch,
             seed=seed,
@@ -726,6 +802,7 @@ def run_training(
         embedding_model.train()
         aam.train()
         apply_batchnorm_policy(embedding_model)
+
         for position, batch in enumerate(loader, start=start_position):
             logical = round_robin(
                 batch,
@@ -766,17 +843,16 @@ def run_training(
                 scaler.step(optimizer)
                 scaler.update()
                 scale_after = float(scaler.get_scale())
-                optimizer_updated = scale_after >= scale_before
-                if optimizer_updated:
+                if scale_after >= scale_before:
                     break
                 overflow_retries += 1
                 if overflow_retries > 8:
                     raise RuntimeError("AMP overflow retry limit reached")
                 print(
-                    f"AMP overflow retry={overflow_retries}/8 "
-                    f"scale={scale_after}",
+                    f"AMP overflow retry={overflow_retries}/8 scale={scale_after}",
                     flush=True,
                 )
+
             scheduler.step()
             state["global_step"] += 1
             updates_this_call += 1
@@ -786,6 +862,7 @@ def run_training(
             else:
                 state["next_epoch"] = epoch + 1
                 state["next_position"] = 0
+
             if state["global_step"] % config["log_every_updates"] == 0:
                 print(
                     f"TRAIN epoch={epoch + 1}/{config['scheduler']['max_epochs']} "
@@ -816,7 +893,8 @@ def run_training(
             state["best_epoch"] = epoch + 1
             state["patience_counter"] = 0
             atomic_save(
-                output_dir / "best.pt", checkpoint_payload("best_validation_eer")
+                output_dir / "best.pt",
+                checkpoint_payload("best_validation_eer"),
             )
         else:
             state["patience_counter"] += 1
@@ -833,6 +911,7 @@ def run_training(
         )
         if state["patience_counter"] >= config["early_stopping"]["patience"]:
             break
+
     return dict(state)
 
 
@@ -841,38 +920,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--run", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument(
-        "--manifest",
-        type=Path,
-        required=True,
-        help="Frozen 22-column common manifest.csv.",
-    )
+    parser.add_argument("--train-cache-root", type=Path, required=True)
+    parser.add_argument("--validation-cache-root", type=Path, required=True)
     parser.add_argument(
         "--validation-trials",
         type=Path,
         required=True,
-        help="Frozen sample-ID validation trial CSV.",
+        help="Frozen ExperimentProvenance/validation_trials.parquet.",
     )
-    parser.add_argument("--cache-root", type=Path, default=DEFAULT_CACHE_ROOT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args(argv)
+
     if args.run == args.dry_run:
         parser.error("Specify exactly one of --run or --dry-run")
     config_path = args.config.expanduser().resolve(strict=True)
-    manifest_path = args.manifest.expanduser().resolve(strict=True)
+    train_cache_root = args.train_cache_root.expanduser().resolve(strict=True)
+    validation_cache_root = args.validation_cache_root.expanduser().resolve(strict=True)
     trials_path = args.validation_trials.expanduser().resolve(strict=True)
-    cache_root = args.cache_root.expanduser().resolve(strict=True)
     output_dir = args.output_dir.expanduser().resolve()
+
     if args.dry_run:
         if args.resume is not None:
             parser.error("--dry-run does not accept --resume")
         first = run_training(
             config_path=config_path,
-            manifest_path=manifest_path,
+            train_cache_root=train_cache_root,
+            validation_cache_root=validation_cache_root,
             trials_path=trials_path,
-            cache_root=cache_root,
             output_dir=output_dir,
             device_name=args.device,
             resume=None,
@@ -880,9 +956,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         second = run_training(
             config_path=config_path,
-            manifest_path=manifest_path,
+            train_cache_root=train_cache_root,
+            validation_cache_root=validation_cache_root,
             trials_path=trials_path,
-            cache_root=cache_root,
             output_dir=output_dir,
             device_name=args.device,
             resume=output_dir / "last.pt",
@@ -892,9 +968,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         result = run_training(
             config_path=config_path,
-            manifest_path=manifest_path,
+            train_cache_root=train_cache_root,
+            validation_cache_root=validation_cache_root,
             trials_path=trials_path,
-            cache_root=cache_root,
             output_dir=output_dir,
             device_name=args.device,
             resume=args.resume,
