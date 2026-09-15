@@ -119,6 +119,24 @@ _SOURCE_RECORDING_ALIASES = (
 _SPLIT_ALIASES = ("split", "final_split")
 
 
+def _resolve_frozen_trial_target_column(fields: Sequence[str]) -> str:
+    """Return the physical parquet column that stores the binary trial label.
+
+    The primary frozen handoff uses ``label``.  ``target`` is accepted only for
+    backward compatibility with historical/local protocol files.
+    """
+    names = set(fields)
+    if "label" in names:
+        return "label"
+    if "target" in names:
+        return "target"
+    raise ValueError(
+        "Frozen validation parquet must contain a binary 'label' column "
+        "(or legacy 'target' column). Available columns: "
+        f"{sorted(names)}"
+    )
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -431,20 +449,20 @@ def read_frozen_validation_protocol(
             "Install the repository requirements."
         ) from error
     try:
-        frame = pd.read_parquet(
-        path,
-        columns=[
-            "enroll_sample_id",
-            "test_sample_id",
-            "label",
-            ],
-        )
+        import pyarrow.parquet as pq
 
-        frame = frame.rename(
-            columns={"label": "target"}
+        schema_names = pq.read_schema(path).names
+        target_column = _resolve_frozen_trial_target_column(schema_names)
+
+        frame = pd.read_parquet(
+            path,
+            columns=["enroll_sample_id", "test_sample_id", target_column],
         )
     except Exception as error:
         raise ValueError(f"Could not read frozen validation parquet {path}: {error}") from error
+
+    if target_column != "target":
+        frame = frame.rename(columns={target_column: "target"})
 
     if frame.empty:
         raise ValueError("Frozen validation protocol is empty")

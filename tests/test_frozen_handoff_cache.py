@@ -160,3 +160,41 @@ def test_split_cache_can_be_loaded_without_manifest(tmp_path: Path):
     sample = dataset[0]
     assert sample["sample_id"] == "s1"
     assert tuple(sample["fbank"].shape) == FEATURE_SHAPE
+
+
+def test_primary_frozen_protocol_prefers_label_column():
+    from src.frozen_handoff_cache import _resolve_frozen_trial_target_column
+
+    assert (
+        _resolve_frozen_trial_target_column(
+            [
+                "trial_id",
+                "enroll_sample_id",
+                "test_sample_id",
+                "label",
+                "source_dataset",
+                "target_pair_type",
+            ]
+        )
+        == "label"
+    )
+
+
+def test_frozen_protocol_accepts_legacy_target_column():
+    from src.frozen_handoff_cache import _resolve_frozen_trial_target_column
+
+    assert (
+        _resolve_frozen_trial_target_column(
+            ["enroll_sample_id", "test_sample_id", "target"]
+        )
+        == "target"
+    )
+
+
+def test_frozen_protocol_rejects_missing_binary_label_column():
+    from src.frozen_handoff_cache import _resolve_frozen_trial_target_column
+
+    with pytest.raises(ValueError, match="must contain a binary 'label' column"):
+        _resolve_frozen_trial_target_column(
+            ["enroll_sample_id", "test_sample_id"]
+        )
