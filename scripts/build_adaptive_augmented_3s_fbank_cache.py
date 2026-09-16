@@ -216,7 +216,11 @@ def build_cache(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--split", required=True, choices=("train", "validation"))
+    parser.add_argument(
+        "--split",
+        required=True,
+        choices=("train", "validation", "final_test"),
+    )
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--dataset-root", required=True, type=Path)
     parser.add_argument("--cache-root", required=True, type=Path)
@@ -226,7 +230,7 @@ def main() -> None:
     parser.add_argument("--expected-rows", type=int)
     parser.add_argument("--expected-speakers", type=int)
 
-    # Optional explicit column mapping for train-only manifests.  CommonRawBase
+    # Optional explicit column mapping for supplied manifests.  CommonRawBase
     # works with auto-detection and normally needs none of these flags.
     parser.add_argument("--sample-id-column")
     parser.add_argument("--path-column")

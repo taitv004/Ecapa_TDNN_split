@@ -29,6 +29,8 @@ CACHE_IDENTITY_NAME = "fbank_cache_identity_frozen_handoff_v1.json"
 CACHE_INDEX_NAME = "feature_index_frozen_handoff_v1.csv"
 CACHE_SHARD_DIR = "shards"
 FEATURE_SHAPE = (301, 80)
+FROZEN_SPLITS = ("train", "validation", "final_test")
+EVALUATION_SPLITS = ("validation", "final_test")
 CACHE_INDEX_FIELDS = (
     "sample_id",
     "relative_audio_path",
@@ -83,13 +85,26 @@ class CacheArtifact:
 
 @dataclass(frozen=True)
 class FrozenValidationProtocol:
+    """Resolved sample-ID verification protocol.
+
+    The historical name is retained because the training pipeline imports it,
+    but the same representation is also used by the independent final-test
+    evaluator. ``trial_ids`` is optional because the primary frozen validation
+    parquet does not need it during training.
+    """
+
     enroll_indices: np.ndarray
     test_indices: np.ndarray
     targets: np.ndarray
     sha256: str
+    trial_ids: tuple[str, ...] | None = None
 
     def __len__(self) -> int:
         return int(self.targets.shape[0])
+
+
+# Semantically clearer alias for new final-test code.
+FrozenVerificationProtocol = FrozenValidationProtocol
 
 
 _SAMPLE_ID_ALIASES = (
@@ -215,8 +230,8 @@ def read_manifest_split(
     can override any column name when a supplied train manifest uses another
     documented name.  No speaker identity is inferred from a filename/path.
     """
-    if split not in {"train", "validation"}:
-        raise ValueError("split must be 'train' or 'validation'")
+    if split not in FROZEN_SPLITS:
+        raise ValueError("split must be 'train', 'validation' or 'final_test'")
     path = manifest_path.expanduser().resolve(strict=True)
     with path.open("r", encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
@@ -257,15 +272,20 @@ def read_manifest_split(
         for line, raw in enumerate(reader, start=2):
             if split_col:
                 row_split = str(raw[split_col]).strip().casefold()
-                if row_split not in {"train", "validation"}:
+                if row_split not in FROZEN_SPLITS:
                     raise ValueError(
                         f"{path}:{line}: invalid split {raw[split_col]!r}"
                     )
                 if row_split != split:
                     continue
             elif split != "train":
+                if split == "validation":
+                    raise ValueError(
+                        "A validation cache must be built from a manifest with an "
+                        "explicit split/final_split column"
+                    )
                 raise ValueError(
-                    "A validation cache must be built from a manifest with an "
+                    "A final_test cache must be built from a manifest with an "
                     "explicit split/final_split column"
                 )
 
@@ -331,6 +351,10 @@ def read_manifest_split(
 
 
 def read_cache_artifact(cache_root: Path, expected_split: str) -> CacheArtifact:
+    if expected_split not in FROZEN_SPLITS:
+        raise ValueError(
+            "expected_split must be 'train', 'validation' or 'final_test'"
+        )
     root = cache_root.expanduser().resolve(strict=True)
     config_path = root / CACHE_CONFIG_NAME
     identity_path = root / CACHE_IDENTITY_NAME
@@ -399,8 +423,10 @@ def read_cache_artifact(cache_root: Path, expected_split: str) -> CacheArtifact:
                 raise ValueError(f"{index_path}:{line}: invalid cache index row")
             if expected_split == "train" and label < 0:
                 raise ValueError(f"{index_path}:{line}: negative train label")
-            if expected_split == "validation" and label != -1:
-                raise ValueError(f"{index_path}:{line}: validation label must be -1")
+            if expected_split in EVALUATION_SPLITS and label != -1:
+                raise ValueError(
+                    f"{index_path}:{line}: evaluation label must be -1"
+                )
             seen_samples.add(sample_id)
             seen_paths.add(relative)
             rows.append(
@@ -427,85 +453,194 @@ def read_cache_artifact(cache_root: Path, expected_split: str) -> CacheArtifact:
     return CacheArtifact(root=root, config=config, identity=identity, rows=tuple(rows))
 
 
+def read_frozen_verification_protocol(
+    parquet_path: Path,
+    cache_rows: Sequence[CacheFeatureRow],
+    *,
+    expected_split: str,
+    expected_sha256: str | None = None,
+    expected_trial_count: int | None = None,
+    expected_target_count: int | None = None,
+    expected_nontarget_count: int | None = None,
+    verify_unique_pairs: bool = True,
+) -> FrozenVerificationProtocol:
+    """Resolve a frozen sample-ID verification parquet against one cache.
+
+    Mapping is always ``sample_id -> cache row index``.  Trial row order and
+    cache row order therefore never need to match.  The function validates that
+    trial labels agree with the speaker IDs stored in the cache.
+    """
+    if expected_split not in EVALUATION_SPLITS:
+        raise ValueError("verification protocol split must be validation/final_test")
+    if any(row.final_split != expected_split for row in cache_rows):
+        raise ValueError(
+            f"Cache rows do not all belong to expected split {expected_split!r}"
+        )
+
+    path = parquet_path.expanduser().resolve(strict=True)
+    digest = sha256_file(path)
+    if expected_sha256 is not None and digest != expected_sha256:
+        raise ValueError(
+            "Frozen verification trial SHA-256 mismatch: "
+            f"expected {expected_sha256}, got {digest}"
+        )
+
+    try:
+        import pandas as pd
+    except ImportError as error:
+        raise RuntimeError(
+            "Reading verification parquet requires pandas + pyarrow. "
+            "Install the repository requirements."
+        ) from error
+
+    try:
+        import pyarrow.parquet as pq
+
+        schema_names = pq.read_schema(path).names
+        target_column = _resolve_frozen_trial_target_column(schema_names)
+        required = {"enroll_sample_id", "test_sample_id", target_column}
+        missing_columns = required - set(schema_names)
+        if missing_columns:
+            raise ValueError(
+                "Verification parquet is missing columns: "
+                + ", ".join(sorted(missing_columns))
+            )
+        columns = ["enroll_sample_id", "test_sample_id", target_column]
+        has_trial_id = "trial_id" in schema_names
+        if has_trial_id:
+            columns.insert(0, "trial_id")
+        frame = pd.read_parquet(path, columns=columns)
+    except Exception as error:
+        raise ValueError(
+            f"Could not read frozen verification parquet {path}: {error}"
+        ) from error
+
+    if target_column != "target":
+        frame = frame.rename(columns={target_column: "target"})
+    if frame.empty:
+        raise ValueError("Frozen verification protocol is empty")
+    if frame["enroll_sample_id"].isna().any() or frame["test_sample_id"].isna().any():
+        raise ValueError("Frozen verification protocol contains blank sample IDs")
+
+    enroll_ids = frame["enroll_sample_id"].astype(str)
+    test_ids = frame["test_sample_id"].astype(str)
+    if (enroll_ids.str.len() == 0).any() or (test_ids.str.len() == 0).any():
+        raise ValueError("Frozen verification protocol contains blank sample IDs")
+
+    targets = frame["target"].to_numpy(dtype=np.int8, copy=True)
+    if not np.isin(targets, [0, 1]).all():
+        raise ValueError("Frozen verification targets must be binary 0/1")
+
+    sample_to_index = {row.sample_id: index for index, row in enumerate(cache_rows)}
+    if len(sample_to_index) != len(cache_rows):
+        raise ValueError(f"{expected_split} cache sample IDs are not unique")
+
+    enroll = enroll_ids.map(sample_to_index)
+    test = test_ids.map(sample_to_index)
+    if enroll.isna().any() or test.isna().any():
+        missing = set(enroll_ids[enroll.isna()])
+        missing.update(test_ids[test.isna()])
+        raise ValueError(
+            "Frozen trials reference sample IDs absent from "
+            f"{expected_split} cache: " + ", ".join(sorted(missing)[:10])
+        )
+
+    enroll_indices = enroll.to_numpy(dtype=np.int32, copy=True)
+    test_indices = test.to_numpy(dtype=np.int32, copy=True)
+    if np.any(enroll_indices == test_indices):
+        raise ValueError("Frozen verification protocol contains a self-pair")
+
+    trial_ids: tuple[str, ...] | None = None
+    if has_trial_id:
+        if frame["trial_id"].isna().any():
+            raise ValueError("Frozen verification protocol contains blank trial IDs")
+        trial_values = tuple(frame["trial_id"].astype(str).tolist())
+        if any(not value for value in trial_values):
+            raise ValueError("Frozen verification protocol contains blank trial IDs")
+        if len(set(trial_values)) != len(trial_values):
+            raise ValueError("Frozen verification protocol has duplicate trial IDs")
+        trial_ids = trial_values
+
+    if verify_unique_pairs:
+        # Integer packing avoids retaining a Python set of long sample-ID strings.
+        count = len(cache_rows)
+        left = np.minimum(enroll_indices, test_indices).astype(np.int64)
+        right = np.maximum(enroll_indices, test_indices).astype(np.int64)
+        packed = left * np.int64(count) + right
+        if np.unique(packed).size != packed.size:
+            raise ValueError("Frozen verification protocol has duplicate sample pairs")
+
+    speaker_ids = np.asarray([row.speaker_id for row in cache_rows], dtype=object)
+    same = speaker_ids[enroll_indices] == speaker_ids[test_indices]
+    if np.any((targets == 1) != same):
+        raise ValueError(
+            "Frozen verification target disagrees with cache speaker identity"
+        )
+
+    positives = int(targets.sum())
+    negatives = int(targets.size - positives)
+    if expected_trial_count is not None and targets.size != expected_trial_count:
+        raise ValueError(
+            f"Frozen verification trial count mismatch: "
+            f"expected {expected_trial_count}, got {targets.size}"
+        )
+    if expected_target_count is not None and positives != expected_target_count:
+        raise ValueError(
+            f"Frozen verification target count mismatch: "
+            f"expected {expected_target_count}, got {positives}"
+        )
+    if (
+        expected_nontarget_count is not None
+        and negatives != expected_nontarget_count
+    ):
+        raise ValueError(
+            f"Frozen verification non-target count mismatch: "
+            f"expected {expected_nontarget_count}, got {negatives}"
+        )
+    if positives == 0 or negatives == 0:
+        raise ValueError("Both target and non-target trials are required")
+
+    return FrozenVerificationProtocol(
+        enroll_indices=enroll_indices,
+        test_indices=test_indices,
+        targets=targets,
+        sha256=digest,
+        trial_ids=trial_ids,
+    )
+
+
 def read_frozen_validation_protocol(
     parquet_path: Path,
     validation_rows: Sequence[CacheFeatureRow],
     *,
     enforce_primary_frozen_identity: bool = True,
 ) -> FrozenValidationProtocol:
-    """Resolve frozen sample-ID trials directly against the validation cache."""
-    path = parquet_path.expanduser().resolve(strict=True)
-    digest = sha256_file(path)
-    if enforce_primary_frozen_identity and digest != FROZEN_VALIDATION_TRIAL_SHA256:
-        raise ValueError(
-            "Frozen validation trial SHA-256 mismatch: "
-            f"expected {FROZEN_VALIDATION_TRIAL_SHA256}, got {digest}"
-        )
-    try:
-        import pandas as pd
-    except ImportError as error:
-        raise RuntimeError(
-            "Reading validation_trials.parquet requires pandas + pyarrow. "
-            "Install the repository requirements."
-        ) from error
-    try:
-        import pyarrow.parquet as pq
-
-        schema_names = pq.read_schema(path).names
-        target_column = _resolve_frozen_trial_target_column(schema_names)
-
-        frame = pd.read_parquet(
-            path,
-            columns=["enroll_sample_id", "test_sample_id", target_column],
-        )
-    except Exception as error:
-        raise ValueError(f"Could not read frozen validation parquet {path}: {error}") from error
-
-    if target_column != "target":
-        frame = frame.rename(columns={target_column: "target"})
-
-    if frame.empty:
-        raise ValueError("Frozen validation protocol is empty")
-    targets = frame["target"].to_numpy(dtype=np.int8, copy=True)
-    if not np.isin(targets, [0, 1]).all():
-        raise ValueError("Frozen validation targets must be binary 0/1")
-
-    sample_to_index = {row.sample_id: index for index, row in enumerate(validation_rows)}
-    if len(sample_to_index) != len(validation_rows):
-        raise ValueError("Validation cache sample IDs are not unique")
-
-    enroll = frame["enroll_sample_id"].map(sample_to_index)
-    test = frame["test_sample_id"].map(sample_to_index)
-    if enroll.isna().any() or test.isna().any():
-        missing = set(frame.loc[enroll.isna(), "enroll_sample_id"].astype(str))
-        missing.update(frame.loc[test.isna(), "test_sample_id"].astype(str))
-        raise ValueError(
-            "Frozen trials reference sample IDs absent from validation cache: "
-            + ", ".join(sorted(missing)[:10])
-        )
-    enroll_indices = enroll.to_numpy(dtype=np.int32, copy=True)
-    test_indices = test.to_numpy(dtype=np.int32, copy=True)
-    if np.any(enroll_indices == test_indices):
-        raise ValueError("Frozen validation protocol contains a self-pair")
-
-    speaker_ids = np.asarray([row.speaker_id for row in validation_rows], dtype=object)
-    same = speaker_ids[enroll_indices] == speaker_ids[test_indices]
-    if np.any((targets == 1) != same):
-        raise ValueError("Frozen trial target disagrees with validation speaker identity")
-
-    positives = int(targets.sum())
-    negatives = int(targets.size - positives)
-    if enforce_primary_frozen_identity and (
-        targets.size != FROZEN_VALIDATION_TRIAL_COUNT
-        or positives != FROZEN_VALIDATION_TARGET_COUNT
-        or negatives != FROZEN_VALIDATION_NONTARGET_COUNT
-    ):
-        raise ValueError(
-            "Frozen validation trial counts do not match the primary handoff"
-        )
-    return FrozenValidationProtocol(
-        enroll_indices=enroll_indices,
-        test_indices=test_indices,
-        targets=targets,
-        sha256=digest,
+    """Resolve the primary frozen validation protocol against its cache."""
+    return read_frozen_verification_protocol(
+        parquet_path,
+        validation_rows,
+        expected_split="validation",
+        expected_sha256=(
+            FROZEN_VALIDATION_TRIAL_SHA256
+            if enforce_primary_frozen_identity
+            else None
+        ),
+        expected_trial_count=(
+            FROZEN_VALIDATION_TRIAL_COUNT
+            if enforce_primary_frozen_identity
+            else None
+        ),
+        expected_target_count=(
+            FROZEN_VALIDATION_TARGET_COUNT
+            if enforce_primary_frozen_identity
+            else None
+        ),
+        expected_nontarget_count=(
+            FROZEN_VALIDATION_NONTARGET_COUNT
+            if enforce_primary_frozen_identity
+            else None
+        ),
+        # The primary validation reader historically did not spend memory/time
+        # rechecking pair uniqueness for >1M already-frozen trials.
+        verify_unique_pairs=False,
     )
