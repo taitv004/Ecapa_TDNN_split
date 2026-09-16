@@ -26,7 +26,11 @@ from src.frozen_handoff_cache import (
     sha256_file,
 )
 from src.speechbrain_frontend import SpeechBrainECAPAFrontend
-from src.verification_metrics import calculate_eer
+from src.verification_metrics import (
+    calculate_eer,
+    calculate_min_dcf,
+    calculate_tar_at_far,
+)
 
 
 CHECKPOINT_SCHEMA = "frozen_handoff_ecapa_aam_training_v1"
@@ -202,7 +206,22 @@ def evaluate(
 
     scores = score_trials(embeddings, protocol)
     targets = protocol.targets.astype(np.int64, copy=False)
-    metric = calculate_eer(scores.tolist(), targets.tolist())
+    score_values = scores.tolist()
+    target_values = targets.tolist()
+
+    metric = calculate_eer(score_values, target_values)
+    min_dcf = calculate_min_dcf(
+        score_values,
+        target_values,
+        p_target=0.01,
+        c_miss=1.0,
+        c_fa=1.0,
+    )
+    tar_at_far = calculate_tar_at_far(
+        score_values,
+        target_values,
+        maximum_far=0.001,
+    )
 
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -248,6 +267,21 @@ def evaluate(
         "eer_interpolated_threshold": float(metric.interpolated_threshold),
         "eer_empirical_threshold_descriptive_only": float(
             metric.empirical_threshold
+        ),
+        "min_dcf_norm_p01": float(min_dcf.normalized_min_dcf),
+        "min_dcf_p_target": float(min_dcf.p_target),
+        "min_dcf_c_miss": float(min_dcf.c_miss),
+        "min_dcf_c_fa": float(min_dcf.c_fa),
+        "min_dcf_threshold_descriptive_only": float(min_dcf.threshold),
+        "min_dcf_far": float(min_dcf.far),
+        "min_dcf_frr": float(min_dcf.frr),
+        "tar_at_far_1e_3": float(tar_at_far.tar),
+        "tar_at_far_requested": float(tar_at_far.requested_max_far),
+        "tar_at_far_achieved": float(tar_at_far.achieved_far),
+        "tar_at_far_threshold_descriptive_only": float(tar_at_far.threshold),
+        "metric_definition_note": (
+            "Reported thesis metrics: EER; normalized minDCF with "
+            "P_target=0.01, C_miss=1, C_fa=1; and TAR at FAR<=0.1%."
         ),
         "threshold_note": (
             "Final-test thresholds are descriptive only. Any operational "

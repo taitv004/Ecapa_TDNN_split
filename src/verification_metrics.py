@@ -15,6 +15,28 @@ class OperatingPoint:
 
 
 @dataclass(frozen=True)
+class MinDCFResult:
+    p_target: float
+    c_miss: float
+    c_fa: float
+    normalized_min_dcf: float
+    unnormalized_min_dcf: float
+    threshold: float
+    far: float
+    frr: float
+    tar: float
+
+
+@dataclass(frozen=True)
+class TARAtFARResult:
+    requested_max_far: float
+    achieved_far: float
+    tar: float
+    frr: float
+    threshold: float
+
+
+@dataclass(frozen=True)
 class EERResult:
     interpolated_eer: float
     interpolated_eer_percentage: float
@@ -144,3 +166,107 @@ def calculate_eer(scores: Sequence[float], targets: Sequence[int]) -> EERResult:
         far=interpolated_far,
         frr=interpolated_frr,
     )
+
+
+def calculate_min_dcf(
+    scores: Sequence[float],
+    targets: Sequence[int],
+    *,
+    p_target: float = 0.01,
+    c_miss: float = 1.0,
+    c_fa: float = 1.0,
+) -> MinDCFResult:
+    """Return minimum normalized DCF over all empirical operating points.
+
+    Normalization follows:
+        DCF / min(C_miss * P_target, C_fa * (1 - P_target))
+    """
+    if not 0.0 < p_target < 1.0:
+        raise ValueError("p_target must lie strictly between 0 and 1")
+    if c_miss <= 0.0 or c_fa <= 0.0:
+        raise ValueError("c_miss and c_fa must be positive")
+
+    points = verification_operating_points(scores, targets)
+    normalization = min(
+        c_miss * p_target,
+        c_fa * (1.0 - p_target),
+    )
+    if normalization <= 0.0:
+        raise ValueError("DCF normalization must be positive")
+
+    best = None
+    for point in points:
+        raw_dcf = (
+            c_miss * point.frr * p_target
+            + c_fa * point.far * (1.0 - p_target)
+        )
+        normalized = raw_dcf / normalization
+
+        # Deterministic tie-breaking:
+        # lower normalized DCF, then lower raw DCF, then lower FAR,
+        # then lower FRR, then higher threshold.
+        candidate = (
+            normalized,
+            raw_dcf,
+            point.far,
+            point.frr,
+            -point.threshold,
+            point,
+        )
+        if best is None or candidate[:-1] < best[:-1]:
+            best = candidate
+
+    if best is None:
+        raise RuntimeError("No minDCF operating point was produced")
+
+    point = best[-1]
+    return MinDCFResult(
+        p_target=float(p_target),
+        c_miss=float(c_miss),
+        c_fa=float(c_fa),
+        normalized_min_dcf=float(best[0]),
+        unnormalized_min_dcf=float(best[1]),
+        threshold=float(point.threshold),
+        far=float(point.far),
+        frr=float(point.frr),
+        tar=float(1.0 - point.frr),
+    )
+
+
+def calculate_tar_at_far(
+    scores: Sequence[float],
+    targets: Sequence[int],
+    *,
+    maximum_far: float = 0.001,
+) -> TARAtFARResult:
+    """Return the highest empirical TAR whose FAR does not exceed maximum_far."""
+    if not 0.0 <= maximum_far <= 1.0:
+        raise ValueError("maximum_far must be within [0, 1]")
+
+    eligible = [
+        point
+        for point in verification_operating_points(scores, targets)
+        if point.far <= maximum_far + 1e-15
+    ]
+    if not eligible:
+        raise RuntimeError("No operating point satisfies the requested FAR")
+
+    # Maximize TAR. Ties prefer the operating point closest to the FAR budget,
+    # then the higher threshold for deterministic reporting.
+    best = max(
+        eligible,
+        key=lambda point: (
+            1.0 - point.frr,
+            point.far,
+            point.threshold,
+        ),
+    )
+
+    return TARAtFARResult(
+        requested_max_far=float(maximum_far),
+        achieved_far=float(best.far),
+        tar=float(1.0 - best.frr),
+        frr=float(best.frr),
+        threshold=float(best.threshold),
+    )
+

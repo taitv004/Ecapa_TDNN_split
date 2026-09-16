@@ -5,7 +5,12 @@ import math
 import random
 import unittest
 
-from src.verification_metrics import calculate_eer, verification_operating_points
+from src.verification_metrics import (
+    calculate_eer,
+    calculate_min_dcf,
+    calculate_tar_at_far,
+    verification_operating_points,
+)
 
 
 def brute_force_points(scores, targets):
@@ -98,6 +103,58 @@ class MetricTests(unittest.TestCase):
                 expected = brute_force_points(scores, targets)
                 actual = [(p.threshold, p.far, p.frr) for p in verification_operating_points(scores, targets)]
                 self.assertEqual(actual, expected)
+
+
+    def test_min_dcf_perfect_separation_is_zero(self):
+        scores, targets = [.9, .8, .2, .1], [1, 1, 0, 0]
+        result = calculate_min_dcf(
+            scores,
+            targets,
+            p_target=0.01,
+            c_miss=1.0,
+            c_fa=1.0,
+        )
+        self.assertEqual(result.normalized_min_dcf, 0.0)
+        self.assertEqual(result.far, 0.0)
+        self.assertEqual(result.frr, 0.0)
+        self.assertEqual(result.tar, 1.0)
+
+    def test_min_dcf_is_bounded_by_reject_all_baseline(self):
+        scores, targets = [.9, .6, .8, .7, .1], [1, 1, 0, 0, 0]
+        result = calculate_min_dcf(scores, targets, p_target=0.01)
+        self.assertGreaterEqual(result.normalized_min_dcf, 0.0)
+        self.assertLessEqual(result.normalized_min_dcf, 1.0)
+
+    def test_tar_at_far_perfect_separation(self):
+        scores, targets = [.9, .8, .2, .1], [1, 1, 0, 0]
+        result = calculate_tar_at_far(
+            scores,
+            targets,
+            maximum_far=0.001,
+        )
+        self.assertEqual(result.tar, 1.0)
+        self.assertLessEqual(result.achieved_far, 0.001)
+
+    def test_tar_at_far_respects_far_budget(self):
+        scores = [.95, .70, .65, .90, .60, .10]
+        targets = [1, 1, 1, 0, 0, 0]
+        result = calculate_tar_at_far(
+            scores,
+            targets,
+            maximum_far=0.001,
+        )
+        self.assertGreaterEqual(result.tar, 0.0)
+        self.assertLessEqual(result.tar, 1.0)
+        self.assertLessEqual(result.achieved_far, 0.001 + 1e-15)
+
+    def test_new_metric_argument_validation(self):
+        scores, targets = [.8, .2], [1, 0]
+        with self.assertRaises(ValueError):
+            calculate_min_dcf(scores, targets, p_target=0.0)
+        with self.assertRaises(ValueError):
+            calculate_min_dcf(scores, targets, c_miss=0.0)
+        with self.assertRaises(ValueError):
+            calculate_tar_at_far(scores, targets, maximum_far=-0.1)
 
 
 if __name__ == "__main__":
